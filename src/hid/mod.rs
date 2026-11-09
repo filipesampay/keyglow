@@ -32,6 +32,9 @@ pub struct HidInfo {
     pub usage_page: u16,
     pub usage: u16,
     pub product: String,
+    /// Versão do dispositivo informada pelo USB (bcdDevice); 0 = desconhecida.
+    /// Nos teclados EVision é a versão do firmware.
+    pub release: u16,
 }
 
 /// Canal de relatórios HID. É um trait para os drivers poderem ser testados

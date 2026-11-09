@@ -30,6 +30,7 @@ pub fn enumerate() -> io::Result<Vec<HidInfo>> {
             usage_page: d.usage_page(),
             usage: d.usage(),
             product: d.product_string().unwrap_or_default().trim().to_string(),
+            release: d.release_number(),
         })
         .collect())
 }

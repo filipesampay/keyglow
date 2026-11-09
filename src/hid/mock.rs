@@ -11,6 +11,12 @@ pub struct MockEvision {
     pub config: Vec<u8>,
     /// Resposta ao comando 0x03 (capacidades).
     pub capabilities: Vec<u8>,
+    /// Tabela de teclas como o firmware guarda (coluna por coluna).
+    pub keys: Vec<u8>,
+    /// Memória das macros.
+    pub macros: Vec<u8>,
+    /// Quantas vezes o reset de fábrica foi pedido.
+    pub resets: usize,
     pending: Option<[u8; 64]>,
 }
 
@@ -19,7 +25,19 @@ impl MockEvision {
         let mut config = vec![0u8; 0x200];
         // Perfil 0 com o efeito "fixo" vermelho, brilho 4, velocidade 3.
         config[1..9].copy_from_slice(&[5, 4, 3, 0, 0, 255, 0, 0]);
-        Self { writes, config, capabilities: vec![0xAA, 0x55, 0, 0, 0, 126, 0], pending: None }
+        // Cada posição digita um código diferente; a tecla Fn fica na linha 5, coluna 5.
+        let mut cells: Vec<[u8; 3]> = (0..126).map(|i| [0x20, 0, 4 + (i % 96) as u8]).collect();
+        cells[110] = [0xA0, 1, 0];
+        let keys = crate::onboard::table_to_firmware(&cells);
+        Self {
+            writes,
+            config,
+            capabilities: vec![0xAA, 0x55, 0, 0, 0, 126, 0],
+            keys,
+            macros: vec![0xFF; 4096],
+            resets: 0,
+            pending: None,
+        }
     }
 }
 
@@ -32,6 +50,11 @@ impl HidIo for MockEvision {
         match cmd {
             0x05 => resp[8..8 + size].copy_from_slice(&self.config[off..off + size]),
             0x06 => self.config[off..off + size].copy_from_slice(&buf[8..8 + size]),
+            0x08 => resp[8..8 + size].copy_from_slice(&self.keys[off..off + size]),
+            0x09 => self.keys[off..off + size].copy_from_slice(&buf[8..8 + size]),
+            0x14 => resp[8..8 + size].copy_from_slice(&self.macros[off..off + size]),
+            0x15 => self.macros[off..off + size].copy_from_slice(&buf[8..8 + size]),
+            0x0D => self.resets += 1,
             0x03 => {
                 let n = size.min(self.capabilities.len());
                 resp[8..8 + n].copy_from_slice(&self.capabilities[..n]);

@@ -26,6 +26,7 @@ mod hid;
 mod input;
 mod keyboard_view;
 mod keymap;
+mod onboard;
 mod screenshot;
 mod theme;
 

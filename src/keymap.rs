@@ -75,6 +75,21 @@ pub fn hid_usage_to_evdev(usage: u16) -> Option<u16> {
     Some(code)
 }
 
+/// Código evdev -> uso HID da página teclado (inverso de [`hid_usage_to_evdev`]).
+/// A tecla `]` do ABNT2 (evdev 43) sai como 0x32, o código que ela tem nos
+/// teclados ISO/ABNT2.
+pub fn evdev_to_hid_usage(code: u16) -> Option<u8> {
+    if code == 43 {
+        return Some(0x32);
+    }
+    (0u8..=0xE7).find(|&u| hid_usage_to_evdev(u as u16) == Some(code))
+}
+
+/// Usos HID que o keyglow sabe nomear, para escolher numa lista.
+pub fn keyboard_usages() -> Vec<u8> {
+    (0u8..=0xE7).filter(|&u| u != 0x31 && hid_usage_to_evdev(u as u16).is_some()).collect()
+}
+
 /// Nome de LED do OpenRGB (`"Key: A"`, `"Key: Left Shift"`...) -> código evdev.
 pub fn openrgb_name_to_evdev(name: &str) -> Option<u16> {
     let key = name.strip_prefix("Key: ")?.trim();
@@ -179,6 +194,17 @@ mod tests {
         assert_eq!(hid_usage_to_evdev(0x61), Some(73)); // numérico 9
         assert_eq!(hid_usage_to_evdev(0xE6), Some(100));
         assert_eq!(hid_usage_to_evdev(0x00), None);
+    }
+
+    #[test]
+    fn evdev_to_hid_is_the_inverse() {
+        for u in keyboard_usages() {
+            let code = hid_usage_to_evdev(u as u16).unwrap();
+            assert_eq!(evdev_to_hid_usage(code), Some(u), "uso 0x{u:02x}");
+        }
+        assert_eq!(evdev_to_hid_usage(43), Some(0x32));
+        assert_eq!(evdev_to_hid_usage(30), Some(0x04));
+        assert_eq!(evdev_to_hid_usage(9999), None);
     }
 
     #[test]

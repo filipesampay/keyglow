@@ -220,6 +220,25 @@ pub struct ViewData<'a> {
     pub pressed: &'a BTreeSet<u16>,
     /// Posição atual da calibração, se ela estiver em andamento.
     pub calibrating: Option<usize>,
+    /// LED da tecla escolhida para edição.
+    pub selected: Option<usize>,
+    /// LEDs com destaque verde (teclas alteradas).
+    pub marked: Option<&'a BTreeSet<usize>>,
+}
+
+impl ViewData<'_> {
+    /// Destaque fora da calibração: tecla apertada, escolhida ou alterada.
+    fn mark(&self, led: Option<usize>, pressed: bool) -> Mark {
+        if pressed {
+            Mark::Pressed
+        } else if led.is_some() && led == self.selected {
+            Mark::Target
+        } else if led.is_some_and(|l| self.marked.is_some_and(|m| m.contains(&l))) {
+            Mark::Mapped
+        } else {
+            Mark::None
+        }
+    }
 }
 
 /// Resultado da interação com o desenho.
@@ -258,7 +277,7 @@ pub fn physical(ui: &mut egui::Ui, data: &ViewData, max_height: f32) -> ViewResp
         }
         let led = data.key_to_led.get(&key.code).copied().filter(|&l| l < data.preview.len());
         let light = led.map(|l| data.preview[l]).unwrap_or([0; 3]);
-        let mark = if data.pressed.contains(&key.code) { Mark::Pressed } else { Mark::None };
+        let mark = data.mark(led, data.pressed.contains(&key.code));
         draw_cap(&painter, &rects, light, &legend(key.code), mark, unit, led.is_some());
         if let (Some(p), Some(l)) = (pointer, led)
             && rects.iter().any(|r| r.contains(p))
@@ -297,7 +316,7 @@ pub fn matrix(ui: &mut egui::Ui, data: &ViewData, max_height: f32) -> ViewRespon
         } else if data.calibrating.is_some() && code.is_some() {
             Mark::Mapped
         } else {
-            Mark::None
+            data.mark(Some(led), false)
         };
         if !data.grid.has_led(led) {
             painter.rect_stroke(rect, CornerRadius::same(4), Stroke::new(1.0, with_alpha(Color32::WHITE, 0.04)), StrokeKind::Inside);

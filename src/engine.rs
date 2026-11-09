@@ -8,6 +8,7 @@
 use crate::drivers::{self, DeviceEntry, Driver, Grid, HwMode, Rgb, Source};
 use crate::effects::{AudioData, Ctx, Effect, KeyEvent, Params, EFFECTS};
 use crate::input::InputState;
+use crate::onboard::{self, Cell, Macro};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -27,8 +28,28 @@ pub enum Cmd {
     Select(String),
     /// Procura teclados de novo.
     Rescan,
+    /// Lê ou grava a memória do teclado (teclas, macros).
+    Onboard(OnboardCmd),
     /// Restaura o efeito de fábrica e encerra a thread.
     Shutdown,
+}
+
+pub enum OnboardCmd {
+    LoadKeys,
+    /// Altera estas posições (linha por linha) da tabela de teclas.
+    SetKeys(Vec<(usize, Cell)>),
+    LoadMacros,
+    SaveMacros(Vec<Macro>),
+    FactoryReset,
+}
+
+/// O que a interface sabe da memória do teclado conectado.
+#[derive(Clone, Debug, Default)]
+pub struct OnboardState {
+    pub keys: Option<Vec<Cell>>,
+    pub macros: Option<Vec<Macro>>,
+    /// Resultado da última operação: (deu certo, mensagem).
+    pub message: Option<(bool, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -46,6 +67,9 @@ pub struct DeviceView {
     pub hw_modes: &'static [(u8, &'static str)],
     /// Mapa de teclas conhecido sem calibração.
     pub default_key_map: BTreeMap<u16, usize>,
+    /// O keyglow sabe mexer nas teclas e macros gravadas neste teclado.
+    pub onboard: bool,
+    pub firmware: Option<u16>,
 }
 
 /// Estado compartilhado entre o motor e a interface.
@@ -64,6 +88,9 @@ pub struct Shared {
     pub devices: Vec<DeviceEntry>,
     /// Teclado conectado.
     pub device: Option<DeviceView>,
+    /// Conta as conexões (a interface relê o efeito do teclado a cada uma).
+    pub connections: u64,
+    pub onboard: OnboardState,
 }
 
 impl Shared {
@@ -78,6 +105,8 @@ impl Shared {
             fps: 0.0,
             devices: Vec::new(),
             device: None,
+            connections: 0,
+            onboard: OnboardState::default(),
         }
     }
 }
@@ -175,6 +204,7 @@ impl Engine {
                         self.wanted = Some(id);
                         self.last_attempt = None;
                     }
+                    Cmd::Onboard(c) => self.onboard_cmd(c),
                     Cmd::Rescan => {
                         if self.kb.is_some() {
                             self.shared.lock().unwrap().devices = drivers::scan().0;
@@ -234,7 +264,7 @@ impl Engine {
         };
         let saved = self.hw;
         match drivers::open(&entry).and_then(|mut kb| kb.connect(&saved).map(|hw| (kb, hw))) {
-            Ok((kb, device_hw)) => {
+            Ok((mut kb, device_hw)) => {
                 if let Some(hw) = device_hw {
                     self.hw = hw;
                 }
@@ -250,10 +280,14 @@ impl Engine {
                     grid: self.grid.clone(),
                     hw_modes: kb.hw_modes(),
                     default_key_map: kb.default_key_map(),
+                    onboard: kb.onboard().is_some(),
+                    firmware: kb.firmware_version(),
                 };
                 let mut sh = self.shared.lock().unwrap();
                 sh.device_hw = device_hw;
                 sh.device = Some(view);
+                sh.connections += 1;
+                sh.onboard = OnboardState::default();
                 sh.preview = vec![[0; 3]; self.grid.len()];
                 sh.status = Status::Connected;
                 drop(sh);
@@ -269,6 +303,43 @@ impl Engine {
         self.in_direct = false;
         self.last_attempt = Some(Instant::now());
         self.shared.lock().unwrap().status = Status::Connecting(format!("conexão perdida: {reason}"));
+    }
+
+    /// Executa um pedido sobre a memória do teclado e publica o resultado.
+    fn onboard_cmd(&mut self, c: OnboardCmd) {
+        let writes = !matches!(c, OnboardCmd::LoadKeys | OnboardCmd::LoadMacros);
+        if writes {
+            // Nada de imagens do modo direto no meio de uma gravação.
+            self.leave_direct();
+        }
+        let reset = matches!(c, OnboardCmd::FactoryReset);
+        let result = match self.kb.as_mut().and_then(|kb| kb.onboard()) {
+            Some(ob) => run_onboard(ob, c),
+            None => Err(std::io::Error::other("o teclado conectado não guarda teclas e macros no formato que o keyglow conhece")),
+        };
+        let mut sh = self.shared.lock().unwrap();
+        match result {
+            Ok(done) => {
+                if let Some(keys) = done.keys {
+                    sh.onboard.keys = Some(keys);
+                }
+                if let Some(macros) = done.macros {
+                    sh.onboard.macros = Some(macros);
+                }
+                if let Some(msg) = done.message {
+                    sh.onboard.message = Some((true, msg));
+                }
+            }
+            Err(e) => sh.onboard.message = Some((false, e.to_string())),
+        }
+        drop(sh);
+        if reset {
+            // O teclado reinicia: conecta de novo para ler o estado de fábrica.
+            thread::sleep(Duration::from_secs(2));
+            self.kb = None;
+            self.in_direct = false;
+            self.last_attempt = None;
+        }
     }
 
     fn leave_direct(&mut self) {
@@ -372,5 +443,100 @@ impl Engine {
         kb.send_frame(frame)?;
         self.last_sent = Some((frame.to_vec(), Instant::now()));
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct OnboardDone {
+    keys: Option<Vec<Cell>>,
+    macros: Option<Vec<Macro>>,
+    message: Option<String>,
+}
+
+fn run_onboard(ob: &mut dyn drivers::Onboard, c: OnboardCmd) -> std::io::Result<OnboardDone> {
+    let mut done = OnboardDone::default();
+    match c {
+        OnboardCmd::LoadKeys => done.keys = Some(ob.read_keys()?),
+        OnboardCmd::SetKeys(edits) => {
+            // Sempre a partir do que está no teclado agora: só as posições
+            // pedidas mudam, o resto (inclusive a tecla Fn) fica igual.
+            let mut table = ob.read_keys()?;
+            let changed = onboard::apply_key_edits(&mut table, &edits);
+            if changed > 0 {
+                ob.write_keys(&table)?;
+            }
+            let after = ob.read_keys()?;
+            if after != table {
+                done.keys = Some(after);
+                return Err(std::io::Error::other("o teclado não guardou o mapa de teclas como enviado"));
+            }
+            done.keys = Some(after);
+            done.message = Some(match changed {
+                0 => "nada mudou".into(),
+                1 => "1 tecla gravada no teclado".into(),
+                n => format!("{n} teclas gravadas no teclado"),
+            });
+        }
+        OnboardCmd::LoadMacros => {
+            let block = ob.read_macros()?;
+            done.macros = Some(onboard::decode_macros(&block).map_err(std::io::Error::other)?);
+        }
+        OnboardCmd::SaveMacros(macros) => {
+            let block = onboard::encode_macros(&macros);
+            ob.write_macros(&block)?;
+            let back = ob.read_macros()?;
+            if back.get(..block.len()) != Some(block.as_slice()) {
+                return Err(std::io::Error::other("o teclado não guardou as macros como enviadas"));
+            }
+            done.macros = Some(onboard::decode_macros(&back).map_err(std::io::Error::other)?);
+            done.message = Some("macros gravadas no teclado".into());
+        }
+        OnboardCmd::FactoryReset => {
+            ob.factory_reset()?;
+            done.message = Some("teclado voltou ao padrão de fábrica".into());
+        }
+    }
+    Ok(done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::drivers::evision::Evision;
+    use crate::hid::mock::MockEvision;
+    use crate::onboard::{KeyAction, MacroInput, MacroStep};
+
+    fn mock_kb() -> Evision {
+        let mut kb = Evision::with_io(Box::new(MockEvision::new(Arc::new(Mutex::new(Vec::new())))), 0);
+        kb.enable_onboard_for_tests();
+        kb
+    }
+
+    #[test]
+    fn set_keys_reads_modifies_and_verifies() {
+        let mut kb = mock_kb();
+        let ob = kb.onboard().unwrap();
+        let play = KeyAction::Media(0x00CD).encode();
+        let fnk = KeyAction::Fn.encode();
+        let done = run_onboard(ob, OnboardCmd::SetKeys(vec![(5, play), (110, play), (6, fnk)])).unwrap();
+        let keys = done.keys.unwrap();
+        assert_eq!(keys[5], play);
+        assert_eq!(keys[110], fnk, "a tecla Fn não muda");
+        assert_ne!(keys[6], fnk);
+        assert_eq!(done.message.as_deref(), Some("1 tecla gravada no teclado"));
+        // Sem mudanças, nada é gravado.
+        let again = run_onboard(ob, OnboardCmd::SetKeys(vec![(5, play)])).unwrap();
+        assert_eq!(again.message.as_deref(), Some("nada mudou"));
+    }
+
+    #[test]
+    fn macros_round_trip_through_the_keyboard() {
+        let mut kb = mock_kb();
+        let ob = kb.onboard().unwrap();
+        assert_eq!(run_onboard(ob, OnboardCmd::LoadMacros).unwrap().macros, Some(Vec::new()));
+        let m = vec![MacroStep { input: MacroInput::Key(0x05), press: true, delay_ms: 10 }];
+        let saved = run_onboard(ob, OnboardCmd::SaveMacros(vec![Vec::new(), m.clone()])).unwrap();
+        assert_eq!(saved.macros, Some(vec![Vec::new(), m]));
+        run_onboard(ob, OnboardCmd::FactoryReset).unwrap();
     }
 }

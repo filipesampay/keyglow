@@ -45,6 +45,8 @@ pub struct OnboardUi {
     new_mouse: u8,
     default_delay: u16,
     confirm_reset: bool,
+    /// Na aba Teclas, mostra a grade de posições em vez do desenho.
+    pub show_grid: bool,
     pub state: OnboardState,
 }
 
@@ -65,6 +67,7 @@ impl Default for OnboardUi {
             new_mouse: 1,
             default_delay: 20,
             confirm_reset: false,
+            show_grid: false,
             state: OnboardState::default(),
         }
     }
@@ -73,7 +76,7 @@ impl Default for OnboardUi {
 impl OnboardUi {
     /// Teclado novo (ou reconectado): esquece o que foi lido dele.
     pub fn reset_device(&mut self) {
-        *self = Self { page: self.page, default_delay: self.default_delay, ..Self::default() };
+        *self = Self { page: self.page, default_delay: self.default_delay, show_grid: self.show_grid, ..Self::default() };
     }
 
     pub fn is_recording(&self) -> bool {
@@ -99,7 +102,7 @@ pub fn usage_name(usage: u8) -> String {
         0x53 => "Num Lock".into(),
         0x54..=0x63 | 0x85 => format!("Num {base}"),
         0xE3 | 0xE7 => if usage == 0xE7 { "Win dir.".into() } else { "Win".into() },
-        0xE4..=0xE6 => format!("{base} dir."),
+        0xE4 | 0xE5 => format!("{base} dir."),
         _ => base,
     }
 }
@@ -263,13 +266,14 @@ impl App {
     /// fica em outra posição da matriz.
     pub(super) fn slot_for_led(&self, led: usize) -> Option<usize> {
         let table = self.original_keys().or_else(|| self.ob.state.keys.clone())?;
-        let by_content = self
-            .key_to_led
-            .iter()
-            .find(|&(_, &l)| l == led)
-            .and_then(|(&code, _)| evdev_to_hid_usage(code))
-            .and_then(|u| onboard::slot_of_usage(&table, u));
-        by_content.or((led < onboard::SLOTS).then_some(led))
+        let usage = self.key_to_led.iter().find(|&(_, &l)| l == led).and_then(|(&code, _)| evdev_to_hid_usage(code));
+        let at_led = (led < onboard::SLOTS).then_some(led);
+        match usage {
+            // Na maioria das teclas, a posição do LED já é a da tecla.
+            Some(u) if at_led.is_some_and(|s| table[s] == [0x20, 0, u]) => at_led,
+            Some(u) => onboard::slot_of_usage(&table, u).or(at_led),
+            None => at_led,
+        }
     }
 
     fn led_for_slot(&self, slot: usize, original: &[Cell]) -> usize {
@@ -285,6 +289,29 @@ impl App {
     pub(super) fn changed_leds(&self) -> BTreeSet<usize> {
         let (Some(keys), Some(original)) = (&self.ob.state.keys, self.original_keys()) else { return BTreeSet::new() };
         (0..onboard::SLOTS).filter(|&s| keys[s] != original[s]).map(|s| self.led_for_slot(s, &original)).collect()
+    }
+
+    /// Legenda curta de cada posição (o que ela faz agora), para a grade
+    /// de um teclado ainda não calibrado.
+    pub(super) fn grid_labels(&self) -> std::collections::BTreeMap<usize, String> {
+        let Some(keys) = &self.ob.state.keys else { return Default::default() };
+        keys.iter()
+            .enumerate()
+            .map(|(slot, &c)| {
+                let text = match KeyAction::decode(c) {
+                    KeyAction::Key { mods: 0, usage } => usage_name(usage),
+                    KeyAction::Key { .. } => "Atalho".into(),
+                    KeyAction::Media(_) => "Mídia".into(),
+                    KeyAction::Mouse(_) => "Mouse".into(),
+                    KeyAction::Power(_) => "Energia".into(),
+                    KeyAction::Macro { slot, .. } => format!("M{}", slot + 1),
+                    KeyAction::Fn => "Fn".into(),
+                    KeyAction::Disabled => String::new(),
+                    KeyAction::Other(_) => "?".into(),
+                };
+                (slot, text)
+            })
+            .collect()
     }
 
     pub(super) fn select_key(&mut self, led: usize) {
@@ -635,7 +662,7 @@ impl App {
                             if ui.add_enabled(i + 1 < len, egui::Button::new("↓").small()).clicked() {
                                 swap = Some((i, i + 1));
                             }
-                            if ui.small_button("✕").clicked() {
+                            if ui.small_button("Remover").clicked() {
                                 remove = Some(i);
                             }
                         });
@@ -692,11 +719,11 @@ impl App {
             if cfg!(target_os = "macos") {
                 ui.label(RichText::new("Gravar do teclado: ainda não disponível no macOS").weak());
             } else if self.ob.recording.is_some() {
-                if ui.button("■ Parar gravação").clicked() {
+                if ui.button("Parar gravação").clicked() {
                     self.ob.recording = None;
                 }
                 ui.label(RichText::new("Digite a sequência no teclado...").color(theme::WARN));
-            } else if ui.add_enabled(!full, egui::Button::new("● Gravar do teclado")).clicked() {
+            } else if ui.add_enabled(!full, egui::Button::new("Gravar do teclado")).clicked() {
                 self.input.lock().unwrap().gui_events.clear();
                 self.ob.recording = Some(Instant::now());
             }

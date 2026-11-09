@@ -224,6 +224,8 @@ pub struct ViewData<'a> {
     pub selected: Option<usize>,
     /// LEDs com destaque verde (teclas alteradas).
     pub marked: Option<&'a BTreeSet<usize>>,
+    /// Legendas da grade para LEDs sem tecla calibrada.
+    pub labels: Option<&'a BTreeMap<usize, String>>,
 }
 
 impl ViewData<'_> {
@@ -322,7 +324,7 @@ pub fn matrix(ui: &mut egui::Ui, data: &ViewData, max_height: f32) -> ViewRespon
             painter.rect_stroke(rect, CornerRadius::same(4), Stroke::new(1.0, with_alpha(Color32::WHITE, 0.04)), StrokeKind::Inside);
             continue;
         }
-        let text = code.map(legend).unwrap_or_default();
+        let text = code.map(legend).or_else(|| data.labels.and_then(|l| l.get(&led).cloned())).unwrap_or_default();
         let light = data.preview.get(led).copied().unwrap_or([0; 3]);
         draw_cap(&painter, &[rect], light, &text, mark, unit, true);
         if response.interact_pointer_pos().is_some_and(|p| rect.contains(p)) {

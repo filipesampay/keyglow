@@ -440,6 +440,7 @@ impl App {
         let grid = self.grid.clone();
         let editing_keys = self.ob.page == Page::Keys;
         let changed = if editing_keys { self.changed_leds() } else { BTreeSet::new() };
+        let labels = if editing_keys { self.grid_labels() } else { BTreeMap::new() };
         let data = ViewData {
             preview,
             grid: &grid,
@@ -448,9 +449,11 @@ impl App {
             calibrating: self.calibrating,
             selected: self.ob.selected.filter(|_| editing_keys).map(|(_, led)| led),
             marked: editing_keys.then_some(&changed),
+            labels: editing_keys.then_some(&labels),
         };
         let max_h = ui.available_height() - 44.0;
-        let view = if self.calibrating.is_none() && mapped >= MIN_MAPPED_FOR_PHYSICAL {
+        let grid_only = editing_keys && self.ob.show_grid;
+        let view = if self.calibrating.is_none() && mapped >= MIN_MAPPED_FOR_PHYSICAL && !grid_only {
             keyboard_view::physical(ui, &data, max_h)
         } else {
             keyboard_view::matrix(ui, &data, max_h)
@@ -471,6 +474,10 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.calibrating.is_some() {
                     return;
+                }
+                if editing_keys && mapped >= MIN_MAPPED_FOR_PHYSICAL {
+                    ui.checkbox(&mut self.ob.show_grid, "Grade completa")
+                        .on_hover_text("Mostra todas as posições do teclado, inclusive as que não aparecem no desenho");
                 }
                 let label = if mapped == 0 { "Calibrar teclas" } else { "Recalibrar" };
                 if ui.button(label).clicked() {
@@ -706,7 +713,7 @@ fn segmented<T: PartialEq + Copy, const N: usize>(ui: &mut egui::Ui, value: &mut
                         .fill(if selected { theme::RAISED } else { Color32::TRANSPARENT })
                         .stroke(Stroke::NONE)
                         .corner_radius(CornerRadius::same(6))
-                        .min_size(Vec2::new(104.0, 28.0));
+                        .min_size(Vec2::new(84.0, 28.0));
                     if ui.add(button).clicked() {
                         *value = option;
                     }

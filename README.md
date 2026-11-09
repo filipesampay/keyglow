@@ -8,7 +8,7 @@ O app procura sozinho os teclados compatíveis e fala direto com eles.
 - **Efeitos do app**: calculados em tempo real (~30 quadros/s), incluindo efeitos que reagem
   às teclas e à música que está tocando no PC.
 - **Teclas pressionadas**: aparecem destacadas no teclado desenhado na tela (Linux e Windows).
-- **Teclas e macros gravadas no teclado** (EVision `320f:5016` e `0c45:8501`): mudar o que
+- **Teclas e macros gravadas no teclado** (Husky Anchorage HTG200 e Sled HTG500): mudar o que
   cada tecla faz, criar macros e voltar ao padrão de fábrica. Veja
   [Teclas e macros](#teclas-e-macros).
 
@@ -19,7 +19,7 @@ qual usar no topo da janela.
 
 | Driver | Quais teclados | Situação |
 |---|---|---|
-| **EVision** | Teclados com chip SONiX e firmware EVision V2 (várias marcas chinesas). Reconhecidos pelo ID USB (`320f:*`, `3299:*`, `0c45:8501`) + interface de controle `0xFF1C` | Luz do `320f:5016` testada; teclas e macros ainda não testadas em hardware. Outros modelos: não testados. Antes de usar um modelo desconhecido, o app lê as capacidades dele (comando só de leitura) e só segue se o firmware responder como EVision V2 |
+| **EVision** | Teclados com chip SONiX e firmware EVision V2 (várias marcas chinesas). Reconhecidos pelo ID USB (`320f:*`, `3299:*`, `0c45:8501`) + interface de controle `0xFF1C` | Luz do `320f:5016` (Husky Anchorage HTG200) testada; `0c45:8501` = Husky Sled HTG500; teclas e macros ainda não testadas em hardware. Outros modelos: não testados. Antes de usar um modelo desconhecido, o app lê as capacidades dele (comando só de leitura) e só segue se o firmware responder como EVision V2 |
 | **LampArray** | Qualquer dispositivo que siga o padrão HID LampArray (o da Iluminação Dinâmica do Windows 11), de qualquer marca. O próprio dispositivo informa onde fica cada LED e qual tecla está sobre ele, então não precisa calibrar | Não testado em hardware; testado contra um dispositivo simulado com o descriptor de exemplo da Microsoft |
 | **OpenRGB** | Qualquer teclado que o [OpenRGB](https://openrgb.org) controla, pelo servidor SDK dele (abra o OpenRGB e ligue "SDK Server", porta 6742) | Não testado com o OpenRGB de verdade; testado contra um servidor simulado. Protocolo SDK até a versão 4 |
 
@@ -39,7 +39,7 @@ keyglow --scan
 
 ## Teclas e macros
 
-Nos teclados EVision `320f:5016` e `0c45:8501`, o topo da janela ganha as abas **Teclas**,
+Nos teclados Husky Anchorage HTG200 (`320f:5016`) e Sled HTG500 (`0c45:8501`), o topo da janela ganha as abas **Teclas**,
 **Macros** e **Teclado**. Tudo fica gravado na memória do teclado e vale em qualquer
 computador, com o keyglow fechado.
 
@@ -192,6 +192,8 @@ No `Ctx` você tem: `time`, `dt`, `params` (cores, velocidade e brilho da interf
 - Os nomes dos efeitos de fábrica são aproximados. Só "Fixo", "Reativo" e "Ondulação"
   foram confirmados no `320f:5016`.
 - Teclas e macros ainda não foram testadas num teclado de verdade.
+- O Husky Nomadic HTG800 (`260d:0101`, com receptor 2.4G) usa outro protocolo e não é
+  suportado.
 - Perfis e camada Fn programável não existem nesse firmware: o teclado guarda um mapa de
   teclas só.
 - Teclados LampArray e OpenRGB não têm efeitos de fábrica no keyglow: em "Do teclado", eles

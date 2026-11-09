@@ -6,11 +6,11 @@
 //! onde o checksum é a soma (u16) dos bytes 3..64.
 //!
 //! Modelos:
-//! - `320f:5016`: testado. Os números dos modos de fábrica são os do OpenRGB
+//! - `320f:5016` (Husky Anchorage HTG200): testado. Os números dos modos de fábrica são os do OpenRGB
 //!   menos 1 (5 = fixo, 0x13 = custom).
 //! - `320f:5041` e `3299:0012` (Endorfy Omnis): suportados pelo OpenRGB,
 //!   não testados aqui; usam a numeração do OpenRGB.
-//! - `0c45:8501`: mesmo protocolo, numeração do OpenRGB; não testado.
+//! - `0c45:8501` (Husky Sled HTG500): mesmo protocolo, numeração do OpenRGB; não testado.
 //! - Outros `320f`/`3299` com a interface 0xFF1C: não testados. Ao abrir,
 //!   o keyglow lê as capacidades (comando só de leitura) e só segue se o
 //!   firmware responder como EVision V2.
@@ -46,13 +46,13 @@ struct Model {
 }
 
 const MODELS: &[Model] = &[
-    Model { vid: 0x320F, pid: 0x5016, name: "Teclado EVision 320f:5016", mode_offset: 0, tested: true, onboard: true },
+    Model { vid: 0x320F, pid: 0x5016, name: "Husky Anchorage HTG200", mode_offset: 0, tested: true, onboard: true },
     Model { vid: 0x320F, pid: 0x5041, name: "Teclado EVision 320f:5041", mode_offset: 1, tested: false, onboard: false },
     Model { vid: 0x3299, pid: 0x0012, name: "Endorfy Omnis", mode_offset: 1, tested: false, onboard: false },
     // Mesmo protocolo com outro ID USB. A numeração dos modos começa em 1
     // (0 = luz apagada); se o modo direto usa 0x14 nele ainda não foi visto
     // num teclado de verdade.
-    Model { vid: 0x0C45, pid: 0x8501, name: "Teclado SONiX 0c45:8501", mode_offset: 1, tested: false, onboard: true },
+    Model { vid: 0x0C45, pid: 0x8501, name: "Husky Sled HTG500", mode_offset: 1, tested: false, onboard: true },
 ];
 
 fn find_model(vid: u16, pid: u16) -> Option<&'static Model> {

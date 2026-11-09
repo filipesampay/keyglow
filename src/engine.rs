@@ -313,9 +313,10 @@ impl Engine {
             self.leave_direct();
         }
         let reset = matches!(c, OnboardCmd::FactoryReset);
-        let result = match self.kb.as_mut().and_then(|kb| kb.onboard()) {
-            Some(ob) => run_onboard(ob, c),
-            None => Err(std::io::Error::other("o teclado conectado não guarda teclas e macros no formato que o keyglow conhece")),
+        let result = match self.kb.as_mut().map(|kb| kb.onboard()) {
+            Some(Some(ob)) => run_onboard(ob, c),
+            Some(None) => Err(std::io::Error::other("o teclado conectado não guarda teclas e macros no formato que o keyglow conhece")),
+            None => Err(std::io::Error::other("teclado desconectado")),
         };
         let mut sh = self.shared.lock().unwrap();
         match result {

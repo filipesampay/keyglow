@@ -782,7 +782,7 @@ impl App {
             ui.end_row();
             ui.label(RichText::new("Versão do firmware").weak());
             ui.label(match device.firmware {
-                Some(v) => format!("{}.{:02x}", v >> 8, v & 0xFF),
+                Some(v) => format!("{:x}.{:02x}", v >> 8, v & 0xFF),
                 None => "não informada".into(),
             });
             ui.end_row();

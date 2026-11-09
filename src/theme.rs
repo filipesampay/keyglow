@@ -4,7 +4,7 @@
 //! do próprio teclado. O destaque (seleção, sliders) acompanha a cor que o
 //! teclado está mostrando, em vez de ter um tom fixo.
 
-use crate::device::Rgb;
+use crate::drivers::Rgb;
 use eframe::egui::{self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle};
 use std::sync::Arc;
 

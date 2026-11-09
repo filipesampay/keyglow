@@ -4,7 +4,7 @@
 //! 1. crie uma struct e implemente o trait [`Effect`] para ela;
 //! 2. adicione uma entrada em [`EFFECTS`] no fim deste arquivo.
 
-use crate::device::{Frame, Rgb, COLS, LEDS, ROWS};
+use crate::drivers::{Grid, Rgb};
 use serde::{Deserialize, Serialize};
 
 /// Parâmetros que o usuário ajusta na interface, comuns a todos os efeitos.
@@ -17,7 +17,9 @@ pub struct Params {
     pub speed: f32,
     /// Brilho geral de 0.0 a 1.0.
     pub brightness: f32,
-    /// Cores do efeito "Pintura", uma por LED.
+    /// Cores do efeito "Pintura", uma por célula da grade. É salvo por
+    /// teclado (veja `config`); aqui só é lido de configurações antigas.
+    #[serde(skip_serializing)]
     pub paint: Vec<Rgb>,
 }
 
@@ -28,16 +30,19 @@ impl Default for Params {
             secondary: [10, 0, 30],
             speed: 1.0,
             brightness: 1.0,
-            paint: vec![[40, 0, 80]; LEDS],
+            paint: Vec::new(),
         }
     }
 }
+
+/// Faixas de frequência da análise de áudio.
+pub const BANDS: usize = 21;
 
 /// Análise do áudio que está tocando no PC.
 #[derive(Clone, Copy, Debug)]
 pub struct AudioData {
     /// Intensidade de 0 a 1 de cada faixa de frequência (graves à esquerda).
-    pub bands: [f32; COLS],
+    pub bands: [f32; BANDS],
     /// Intensidade dos graves (0 a 1).
     pub bass: f32,
     /// Volume geral (0 a 1).
@@ -46,7 +51,7 @@ pub struct AudioData {
 
 impl Default for AudioData {
     fn default() -> Self {
-        Self { bands: [0.0; COLS], bass: 0.0, level: 0.0 }
+        Self { bands: [0.0; BANDS], bass: 0.0, level: 0.0 }
     }
 }
 
@@ -56,7 +61,7 @@ pub struct KeyEvent {
     /// Código evdev da tecla (útil para efeitos que reagem a teclas específicas).
     #[allow(dead_code)]
     pub code: u16,
-    /// LED da tecla, se ela já foi calibrada.
+    /// Célula da tecla na grade, se ela já foi calibrada.
     pub led: Option<usize>,
     pub pressed: bool,
 }
@@ -68,14 +73,16 @@ pub struct Ctx<'a> {
     /// Segundos desde o quadro anterior.
     pub dt: f32,
     pub params: &'a Params,
+    /// Grade de LEDs do teclado conectado (`frame` tem `grid.len()` cores).
+    pub grid: &'a Grid,
     pub events: &'a [KeyEvent],
-    /// LEDs das teclas que estão pressionadas agora.
+    /// Células das teclas que estão pressionadas agora.
     pub pressed: &'a [usize],
     pub audio: &'a AudioData,
 }
 
 pub trait Effect: Send {
-    fn render(&mut self, ctx: &Ctx, frame: &mut Frame);
+    fn render(&mut self, ctx: &Ctx, frame: &mut [Rgb]);
 
     /// Retorne `true` para o app capturar o áudio do PC.
     fn uses_audio(&self) -> bool {
@@ -103,10 +110,6 @@ const TWO_COLORS: &[Control] = &[Control::Primary("Cor principal"), Control::Sec
 
 // ---------------------------------------------------------------------------
 // Utilidades de cor e posição
-
-pub fn row_col(led: usize) -> (usize, usize) {
-    (led / COLS, led % COLS)
-}
 
 pub fn lerp(a: Rgb, b: Rgb, t: f32) -> Rgb {
     let t = t.clamp(0.0, 1.0);
@@ -142,7 +145,7 @@ pub fn hsv(h: f32, s: f32, v: f32) -> Rgb {
 struct Paint;
 
 impl Effect for Paint {
-    fn render(&mut self, ctx: &Ctx, frame: &mut Frame) {
+    fn render(&mut self, ctx: &Ctx, frame: &mut [Rgb]) {
         for (i, px) in frame.iter_mut().enumerate() {
             *px = ctx.params.paint.get(i).copied().unwrap_or([0, 0, 0]);
         }
@@ -153,10 +156,10 @@ impl Effect for Paint {
 struct Rainbow;
 
 impl Effect for Rainbow {
-    fn render(&mut self, ctx: &Ctx, frame: &mut Frame) {
+    fn render(&mut self, ctx: &Ctx, frame: &mut [Rgb]) {
         for (i, px) in frame.iter_mut().enumerate() {
-            let (row, col) = row_col(i);
-            let h = col as f32 / COLS as f32 + row as f32 * 0.03 - ctx.time * 0.25 * ctx.params.speed;
+            let (row, col) = ctx.grid.row_col(i);
+            let h = col as f32 / ctx.grid.cols as f32 + row as f32 * 0.03 - ctx.time * 0.25 * ctx.params.speed;
             *px = hsv(h, 1.0, 1.0);
         }
     }
@@ -166,7 +169,7 @@ impl Effect for Rainbow {
 struct Breathing;
 
 impl Effect for Breathing {
-    fn render(&mut self, ctx: &Ctx, frame: &mut Frame) {
+    fn render(&mut self, ctx: &Ctx, frame: &mut [Rgb]) {
         let t = 0.5 - 0.5 * (ctx.time * 2.0 * ctx.params.speed).cos();
         frame.fill(lerp(ctx.params.secondary, ctx.params.primary, t));
     }
@@ -174,17 +177,18 @@ impl Effect for Breathing {
 
 /// A tecla acende ao ser apertada e vai apagando aos poucos.
 struct Reactive {
-    heat: [f32; LEDS],
+    heat: Vec<f32>,
 }
 
 impl Effect for Reactive {
-    fn render(&mut self, ctx: &Ctx, frame: &mut Frame) {
+    fn render(&mut self, ctx: &Ctx, frame: &mut [Rgb]) {
+        self.heat.resize(frame.len(), 0.0);
         for h in self.heat.iter_mut() {
             *h = (*h - ctx.dt * 1.2 * ctx.params.speed).max(0.0);
         }
         // `events` pega toques rápidos; `pressed` mantém aceso enquanto segura.
         let tapped = ctx.events.iter().filter(|e| e.pressed).filter_map(|e| e.led);
-        for led in tapped.chain(ctx.pressed.iter().copied()) {
+        for led in tapped.chain(ctx.pressed.iter().copied()).filter(|&l| l < frame.len()) {
             self.heat[led] = 1.0;
         }
         for (i, px) in frame.iter_mut().enumerate() {
@@ -199,25 +203,26 @@ struct Ripples {
 }
 
 impl Effect for Ripples {
-    fn render(&mut self, ctx: &Ctx, frame: &mut Frame) {
+    fn render(&mut self, ctx: &Ctx, frame: &mut [Rgb]) {
         for ev in ctx.events.iter().filter(|e| e.pressed) {
             if let Some(led) = ev.led {
-                let (r, c) = row_col(led);
+                let (r, c) = ctx.grid.row_col(led);
                 self.waves.push((r as f32, c as f32, ctx.time, (ctx.time * 0.1).fract()));
             }
         }
         let speed = 14.0 * ctx.params.speed;
-        self.waves.retain(|w| (ctx.time - w.2) * speed < COLS as f32 + 6.0);
+        let reach = ctx.grid.cols as f32 + 6.0;
+        self.waves.retain(|w| (ctx.time - w.2) * speed < reach);
 
         for (i, px) in frame.iter_mut().enumerate() {
-            let (r, c) = row_col(i);
+            let (r, c) = ctx.grid.row_col(i);
             let mut color = ctx.params.secondary;
             for &(wr, wc, start, _) in &self.waves {
                 let radius = (ctx.time - start) * speed;
                 // As linhas ficam mais afastadas que as colunas no teclado.
                 let dist = ((r as f32 - wr) * 1.6).hypot(c as f32 - wc);
                 let ring = (1.0 - (dist - radius).abs() / 1.8).max(0.0);
-                let fade = (1.0 - radius / (COLS as f32 + 6.0)).max(0.0);
+                let fade = (1.0 - radius / reach).max(0.0);
                 let wave = lerp(ctx.params.secondary, ctx.params.primary, ring * fade);
                 color = std::array::from_fn(|k| color[k].max(wave[k]));
             }
@@ -234,13 +239,17 @@ impl Effect for Spectrum {
         true
     }
 
-    fn render(&mut self, ctx: &Ctx, frame: &mut Frame) {
+    fn render(&mut self, ctx: &Ctx, frame: &mut [Rgb]) {
+        let (rows, cols) = (ctx.grid.rows, ctx.grid.cols);
         for (i, px) in frame.iter_mut().enumerate() {
-            let (row, col) = row_col(i);
-            let height = ctx.audio.bands[col] * ROWS as f32;
-            let from_bottom = (ROWS - 1 - row) as f32;
+            let (row, col) = ctx.grid.row_col(i);
+            // Cada coluna mostra a faixa correspondente (as faixas se esticam
+            // ou se juntam conforme a largura do teclado).
+            let band = (col * BANDS / cols.max(1)).min(BANDS - 1);
+            let height = ctx.audio.bands[band] * rows as f32;
+            let from_bottom = (rows - 1 - row) as f32;
             let lit = (height - from_bottom).clamp(0.0, 1.0);
-            let color = lerp(ctx.params.primary, ctx.params.secondary, from_bottom / (ROWS - 1) as f32);
+            let color = lerp(ctx.params.primary, ctx.params.secondary, from_bottom / (rows.max(2) - 1) as f32);
             *px = scale(color, lit);
         }
     }
@@ -256,11 +265,11 @@ impl Effect for BassPulse {
         true
     }
 
-    fn render(&mut self, ctx: &Ctx, frame: &mut Frame) {
+    fn render(&mut self, ctx: &Ctx, frame: &mut [Rgb]) {
         self.hue += ctx.dt * 0.05 * ctx.params.speed + ctx.audio.bass * ctx.dt * 0.3;
-        let center = (COLS as f32 - 1.0) / 2.0;
+        let center = ((ctx.grid.cols as f32 - 1.0) / 2.0).max(0.5);
         for (i, px) in frame.iter_mut().enumerate() {
-            let (_, col) = row_col(i);
+            let (_, col) = ctx.grid.row_col(i);
             let spread = 1.0 - (col as f32 - center).abs() / center;
             let v = (ctx.audio.bass * 1.3 - (1.0 - spread) * 0.6).clamp(0.0, 1.0);
             *px = hsv(self.hue + col as f32 * 0.01, 1.0, 0.08 + 0.92 * v);
@@ -292,7 +301,7 @@ pub const EFFECTS: &[EffectInfo] = &[
         name: "Reativo",
         description: "A tecla acende ao apertar e vai apagando",
         controls: TWO_COLORS,
-        build: || Box::new(Reactive { heat: [0.0; LEDS] }),
+        build: || Box::new(Reactive { heat: Vec::new() }),
     },
     EffectInfo {
         name: "Ondas",

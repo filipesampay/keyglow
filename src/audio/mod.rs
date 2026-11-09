@@ -2,14 +2,15 @@
 //!
 //! A captura depende do sistema:
 //! - Linux: monitor da saída padrão do PipeWire, via `pw-record` (`linux.rs`);
-//! - Windows: "loopback" da saída padrão via WASAPI (`windows.rs`).
+//! - Windows: "loopback" da saída padrão via WASAPI (`windows.rs`);
+//! - macOS 14.6+: loopback da saída padrão via process tap do CoreAudio
+//!   (mesmo `windows.rs`).
 //!
 //! Elas só entregam amostras mono em f32; a análise (FFT) fica aqui. A
 //! captura só roda enquanto `wanted` estiver ligado, ou seja, enquanto um
 //! efeito de música estiver ativo.
 
-use crate::device::COLS;
-use crate::effects::AudioData;
+use crate::effects::{AudioData, BANDS};
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,9 +22,9 @@ mod linux;
 #[cfg(target_os = "linux")]
 use linux::capture;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod windows;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use windows::capture;
 
 const FFT_SIZE: usize = 2048;
@@ -70,7 +71,7 @@ struct Analyzer {
     pos: usize,
     fresh: usize,
     spectrum: Vec<Complex<f32>>,
-    smooth: [f32; COLS],
+    smooth: [f32; BANDS],
     peak_db: f32,
 }
 
@@ -88,7 +89,7 @@ impl Analyzer {
             pos: 0,
             fresh: 0,
             spectrum: vec![Complex::new(0.0, 0.0); FFT_SIZE],
-            smooth: [0.0; COLS],
+            smooth: [0.0; BANDS],
             peak_db: -30.0,
         }
     }
@@ -112,7 +113,7 @@ impl Analyzer {
         }
         self.fft.process(&mut self.spectrum);
 
-        let mut band_db = [0.0f32; COLS];
+        let mut band_db = [0.0f32; BANDS];
         for (b, db) in band_db.iter_mut().enumerate() {
             let (lo, hi) = self.edges[b];
             let mag = self.spectrum[lo..hi].iter().map(|c| c.norm()).fold(0.0, f32::max);
@@ -138,14 +139,14 @@ impl Analyzer {
     }
 }
 
-/// Divide o espectro em `COLS` faixas em escala logarítmica (índices dos bins).
+/// Divide o espectro em `BANDS` faixas em escala logarítmica (índices dos bins).
 fn band_edges(rate: f32) -> Vec<(usize, usize)> {
     let bin_hz = rate / FFT_SIZE as f32;
     let ratio = MAX_HZ / MIN_HZ;
-    (0..COLS)
+    (0..BANDS)
         .map(|b| {
-            let f0 = MIN_HZ * ratio.powf(b as f32 / COLS as f32);
-            let f1 = MIN_HZ * ratio.powf((b + 1) as f32 / COLS as f32);
+            let f0 = MIN_HZ * ratio.powf(b as f32 / BANDS as f32);
+            let f1 = MIN_HZ * ratio.powf((b + 1) as f32 / BANDS as f32);
             let lo = (f0 / bin_hz).floor() as usize;
             let hi = ((f1 / bin_hz).ceil() as usize).max(lo + 1);
             (lo.min(FFT_SIZE / 2 - 1), hi.min(FFT_SIZE / 2))

@@ -1,5 +1,7 @@
 //! Windows: grava a saída padrão em modo "loopback" do WASAPI, via `cpal`.
 //! (No WASAPI, abrir um dispositivo de saída como entrada liga o loopback.)
+//! No macOS 14.6+, o cpal faz o mesmo com um "process tap" do CoreAudio
+//! (pede a permissão de gravação do áudio do sistema).
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleFormat;

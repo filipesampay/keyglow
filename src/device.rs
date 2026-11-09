@@ -1,4 +1,5 @@
-//! Comunicação com o teclado SONiX/EVision `320f:5016` via `/dev/hidraw`.
+//! Protocolo do teclado SONiX/EVision `320f:5016` (independente do sistema;
+//! o transporte HID fica em `crate::hid`).
 //!
 //! Protocolo "EVision V2" (o mesmo que o OpenRGB documenta), com uma
 //! diferença descoberta na prática: neste firmware os números dos modos
@@ -8,11 +9,9 @@
 //! `[0x04, chk_lo, chk_hi, cmd, tamanho, off_lo, off_hi, status, dados...]`
 //! onde o checksum é a soma (u16) dos bytes 3..64.
 
+use crate::hid::Port;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::io;
 
 pub const VID: u16 = 0x320F;
 pub const PID: u16 = 0x5016;
@@ -100,44 +99,12 @@ impl Default for HwMode {
 }
 
 pub struct Keyboard {
-    file: File,
+    port: Port,
 }
 
 impl Keyboard {
-    /// Procura a interface de controle (usage page 0xFF1C) do teclado.
-    pub fn find_path() -> io::Result<PathBuf> {
-        let wanted = format!("HID_ID=0003:{:08X}:{:08X}", VID, PID);
-        for entry in fs::read_dir("/sys/class/hidraw")? {
-            let entry = entry?;
-            let dev = entry.path().join("device");
-            let uevent = fs::read_to_string(dev.join("uevent")).unwrap_or_default();
-            if !uevent.lines().any(|l| l == wanted) {
-                continue;
-            }
-            let desc = fs::read(dev.join("report_descriptor")).unwrap_or_default();
-            if desc.windows(3).any(|w| w == [0x06, 0x1C, 0xFF]) {
-                return Ok(PathBuf::from("/dev").join(entry.file_name()));
-            }
-        }
-        Err(io::Error::new(io::ErrorKind::NotFound, "teclado 320f:5016 não encontrado"))
-    }
-
     pub fn open() -> io::Result<Self> {
-        let path = Self::find_path()?;
-        let file = OpenOptions::new().read(true).write(true).open(&path).map_err(|e| {
-            io::Error::new(e.kind(), format!("sem acesso a {}: {e}", path.display()))
-        })?;
-        Ok(Self { file })
-    }
-
-    fn wait_readable(&self) -> io::Result<bool> {
-        let mut pfd = libc::pollfd { fd: self.file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        // SAFETY: `pfd` é um pollfd válido e vive durante toda a chamada.
-        let r = unsafe { libc::poll(&mut pfd, 1, TIMEOUT_MS) };
-        if r < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(r > 0)
+        Ok(Self { port: Port::open()? })
     }
 
     /// Envia um pacote e espera a resposta correspondente.
@@ -154,16 +121,16 @@ impl Keyboard {
         buf[1] = (sum & 0xFF) as u8;
         buf[2] = (sum >> 8) as u8;
 
-        self.file.write_all(&buf)?;
+        self.port.write(&buf)?;
 
         // A mesma interface também manda eventos do botão de volume
         // (outros report IDs), então ignoramos o que não for resposta.
         let mut resp = [0u8; PACKET];
         loop {
-            if !self.wait_readable()? {
+            let n = self.port.read_timeout(&mut resp, TIMEOUT_MS)?;
+            if n == 0 {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "o teclado não respondeu"));
             }
-            let n = self.file.read(&mut resp)?;
             if n == PACKET && resp[0] == REPORT_ID && resp[3] == command && resp[5] == buf[5] && resp[6] == buf[6] {
                 break;
             }

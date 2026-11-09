@@ -83,11 +83,23 @@ pub trait Effect: Send {
     }
 }
 
+/// Ajuste que um efeito usa. O texto é o rótulo mostrado na interface.
+#[derive(Clone, Copy)]
+pub enum Control {
+    Primary(&'static str),
+    Secondary(&'static str),
+    Speed,
+}
+
 pub struct EffectInfo {
     pub name: &'static str,
     pub description: &'static str,
+    /// Ajustes que aparecem na interface (o brilho sempre aparece).
+    pub controls: &'static [Control],
     pub build: fn() -> Box<dyn Effect>,
 }
+
+const TWO_COLORS: &[Control] = &[Control::Primary("Cor principal"), Control::Secondary("Cor de fundo"), Control::Speed];
 
 // ---------------------------------------------------------------------------
 // Utilidades de cor e posição
@@ -258,19 +270,46 @@ impl Effect for BassPulse {
 
 /// Lista de efeitos que aparecem na interface.
 pub const EFFECTS: &[EffectInfo] = &[
-    EffectInfo { name: "Pintura", description: "Clique nas teclas da tela para pintar cada uma", build: || Box::new(Paint) },
-    EffectInfo { name: "Arco-íris", description: "Arco-íris passando pelo teclado", build: || Box::new(Rainbow) },
-    EffectInfo { name: "Respiração", description: "Alterna suavemente entre as duas cores", build: || Box::new(Breathing) },
+    EffectInfo {
+        name: "Pintura",
+        description: "Cada tecla com a cor que você pintar na tela",
+        controls: &[],
+        build: || Box::new(Paint),
+    },
+    EffectInfo {
+        name: "Arco-íris",
+        description: "Arco-íris atravessando o teclado",
+        controls: &[Control::Speed],
+        build: || Box::new(Rainbow),
+    },
+    EffectInfo {
+        name: "Respiração",
+        description: "Alterna suavemente entre as duas cores",
+        controls: TWO_COLORS,
+        build: || Box::new(Breathing),
+    },
     EffectInfo {
         name: "Reativo",
         description: "A tecla acende ao apertar e vai apagando",
+        controls: TWO_COLORS,
         build: || Box::new(Reactive { heat: [0.0; LEDS] }),
     },
     EffectInfo {
         name: "Ondas",
         description: "Ondas saindo de cada tecla apertada",
+        controls: TWO_COLORS,
         build: || Box::new(Ripples { waves: Vec::new() }),
     },
-    EffectInfo { name: "Música: equalizador", description: "Barras por frequência do som que está tocando", build: || Box::new(Spectrum) },
-    EffectInfo { name: "Música: pulso", description: "Pulsa com os graves da música", build: || Box::new(BassPulse { hue: 0.0 }) },
+    EffectInfo {
+        name: "Música: equalizador",
+        description: "Cada coluna é uma faixa de frequência do som que está tocando no PC",
+        controls: &[Control::Primary("Cor de baixo"), Control::Secondary("Cor do topo")],
+        build: || Box::new(Spectrum),
+    },
+    EffectInfo {
+        name: "Música: pulso",
+        description: "O teclado pulsa com os graves do som que está tocando no PC",
+        controls: &[Control::Speed],
+        build: || Box::new(BassPulse { hue: 0.0 }),
+    },
 ];

@@ -25,11 +25,15 @@ fn path() -> Option<PathBuf> {
 
 impl Config {
     pub fn load() -> Self {
-        let Some(p) = path() else { return Self::default() };
-        fs::read_to_string(p)
-            .ok()
+        let mut config: Self = path()
+            .and_then(|p| fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Sem calibração própria, usa o mapa conhecido deste modelo.
+        if config.key_to_led.is_empty() {
+            config.key_to_led = crate::default_layout::default_key_to_led();
+        }
+        config
     }
 
     pub fn save(&self) {
@@ -47,8 +51,4 @@ impl Config {
         }
     }
 
-    /// LED -> código da tecla (o inverso de `key_to_led`).
-    pub fn led_to_key(&self) -> BTreeMap<usize, u16> {
-        self.key_to_led.iter().map(|(&k, &l)| (l, k)).collect()
-    }
 }

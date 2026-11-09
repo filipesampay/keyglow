@@ -1,10 +1,10 @@
 # keyglow
 
-Controle de RGB para o teclado SONiX/EVision `320f:5016` no Linux, escrito em Rust + egui.
+Controle de RGB para o teclado SONiX/EVision `320f:5016` no **Linux e no Windows**, escrito em Rust + egui.
 
 O OpenRGB reconhece o dispositivo, mas não tem driver para esse PID. O keyglow fala direto
-com o teclado pelo `/dev/hidraw`, usando o protocolo EVision V2 (o mesmo documentado pelo
-OpenRGB), com os ajustes que este firmware exige.
+com o teclado (hidraw no Linux, API HID no Windows), usando o protocolo EVision V2 (o mesmo
+documentado pelo OpenRGB), com os ajustes que este firmware exige.
 
 - **Efeitos de fábrica**: gravados no teclado, continuam funcionando com o app fechado.
 - **Efeitos do app**: calculados em tempo real (~30 quadros/s), incluindo efeitos que reagem
@@ -13,12 +13,28 @@ OpenRGB), com os ajustes que este firmware exige.
 
 ## Requisitos
 
-- Linux com PipeWire (`pw-record`) para os efeitos de música
+- Linux com PipeWire (`pw-record`) para os efeitos de música, ou Windows 10/11
 - Rust (`rustup`) para compilar
 - Teclado com ID USB `320f:5016` (veja com `lsusb`). Outros teclados EVision V2 podem
   funcionar trocando `VID`/`PID` em `src/device.rs`, mas não foram testados.
 
-## Instalação
+## Instalação no Windows
+
+Baixe o `keyglow.exe` e rode. Não precisa de instalador nem de permissão de administrador.
+Se o software do fabricante estiver aberto, feche-o: os dois brigam pelo teclado.
+
+No Windows, a leitura de teclas usa um hook global, então ela também vê teclas de outros
+teclados conectados.
+
+Para compilar o `.exe` a partir do Linux:
+
+```sh
+sudo apt install mingw-w64
+rustup target add x86_64-pc-windows-gnu
+cargo build --release --target x86_64-pc-windows-gnu
+```
+
+## Instalação no Linux
 
 ```sh
 # Permissão para o usuário logado acessar só este teclado (cores + leitura das teclas)
@@ -28,20 +44,25 @@ sudo udevadm control --reload && sudo udevadm trigger
 cargo run --release
 ```
 
-Na primeira vez, clique em **Calibrar teclas**: cada LED pisca em branco e você aperta a
-tecla correspondente. Isso ensina ao app onde fica cada tecla. A calibração fica salva em
-`~/.config/keyglow/config.json`.
+O app já vem com o mapa de teclas deste teclado no layout ABNT2. Se o seu for diferente,
+use **Recalibrar**: cada LED pisca em branco e você aperta a tecla correspondente. A
+configuração fica em `~/.config/keyglow/config.json` (Linux) ou
+`%APPDATA%\keyglow\config.json` (Windows).
 
 ## Como funciona
 
 | Arquivo | O que faz |
 |---|---|
-| `src/device.rs` | Protocolo USB (EVision V2 via `/dev/hidraw`) |
+| `src/device.rs` | Protocolo USB (EVision V2), igual nos dois sistemas |
+| `src/hid/` | Transporte HID: `linux.rs` (hidraw) e `windows.rs` (hidapi) |
 | `src/effects.rs` | Efeitos de software: **crie os seus aqui** |
 | `src/engine.rs` | Thread que roda o efeito e envia as imagens ao teclado |
-| `src/input.rs` | Leitura das teclas via evdev |
-| `src/audio.rs` | Captura do som do PC (`pw-record`) + FFT em 21 faixas |
-| `src/app.rs` | Interface gráfica |
+| `src/input/` | Leitura das teclas: evdev (Linux) e hook de teclado (Windows) |
+| `src/audio/` | Som do PC: `pw-record` (Linux) e loopback WASAPI (Windows) + FFT em 21 faixas |
+| `src/app.rs` | Interface gráfica (estado e telas) |
+| `src/keyboard_view.rs` | Desenho do teclado ABNT2 e da grade de calibração |
+| `src/theme.rs` | Cores, fonte (Chakra Petch, OFL) e estilo |
+| `src/default_layout.rs` | Mapa tecla → LED padrão deste teclado |
 
 Detalhes do teclado descobertos na prática:
 - matriz de 6 × 21 LEDs (126), em ordem linha por linha;

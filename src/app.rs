@@ -1,15 +1,30 @@
 //! Interface gráfica (egui).
+//!
+//! Estrutura da janela:
+//! - topo: nome, seletor "Do teclado | Do app" e status da conexão;
+//! - centro: o teclado desenhado, com a luz atual e as teclas pressionadas;
+//! - base: lista de efeitos à esquerda e ajustes do efeito à direita.
 
 use crate::config::Config;
-use crate::device::{hw_mode_name, HwMode, Rgb, COLS, HW_MODES, LEDS, ROWS};
-use crate::effects::{row_col, EFFECTS};
+use crate::device::{hw_mode_name, HwMode, Rgb, COLS, HW_MODES, LEDS};
+use crate::effects::{row_col, Control, EFFECTS};
 use crate::engine::{Cmd, Shared, Status};
-use crate::input::{key_name, InputState};
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
+use crate::input::InputState;
+use crate::keyboard_view::{self, legend, ViewData};
+use crate::theme::{self, semibold};
+use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Sense, Stroke, Vec2};
+use std::collections::BTreeSet;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Mínimo de teclas calibradas para desenhar o teclado físico.
+const MIN_MAPPED_FOR_PHYSICAL: usize = 20;
+/// Intervalo mínimo entre gravações de efeito de fábrica (cada uma escreve
+/// na memória do teclado).
+const HW_APPLY_INTERVAL: Duration = Duration::from_millis(250);
+const CONTROLS_HEIGHT: f32 = 300.0;
 
 pub struct App {
     shared: Arc<Mutex<Shared>>,
@@ -17,24 +32,29 @@ pub struct App {
     tx: Sender<Cmd>,
     engine: Option<JoinHandle<()>>,
     config: Config,
-    /// Efeito de fábrica sendo editado (só vai ao teclado ao clicar em Aplicar).
+    /// Efeito de fábrica sendo editado; vai ao teclado com um pequeno atraso.
     hw_edit: HwMode,
+    last_hw_apply: Instant,
     synced_from_device: bool,
     brush: Rgb,
     /// LED atual da calibração, se ela estiver em andamento.
     calibrating: Option<usize>,
     /// Última tecla mapeada na calibração (código, LED), para conferência.
     last_mapped: Option<(u16, usize)>,
+    accent: Color32,
+    screenshot: Option<crate::screenshot::Screenshot>,
 }
 
 impl App {
     pub fn new(
+        cc: &eframe::CreationContext<'_>,
         shared: Arc<Mutex<Shared>>,
         input: Arc<Mutex<InputState>>,
         tx: Sender<Cmd>,
         engine: JoinHandle<()>,
         mut config: Config,
     ) -> Self {
+        theme::install(&cc.egui_ctx);
         // Limpa mapeamentos inválidos de versões anteriores (volume, tecla fantasma).
         config.key_to_led.retain(|&code, _| is_mappable(code));
         shared.lock().unwrap().key_to_led = config.key_to_led.clone();
@@ -44,11 +64,14 @@ impl App {
             tx,
             engine: Some(engine),
             hw_edit: config.hw,
+            last_hw_apply: Instant::now(),
             config,
             synced_from_device: false,
             brush: [255, 255, 255],
             calibrating: None,
             last_mapped: None,
+            accent: Color32::TRANSPARENT,
+            screenshot: crate::screenshot::Screenshot::from_env(),
         }
     }
 
@@ -56,12 +79,51 @@ impl App {
         let _ = self.tx.send(cmd);
     }
 
+    fn is_software(&self) -> bool {
+        self.config.software_effect.is_some()
+    }
+
+    fn set_mode(&mut self, software: bool) {
+        if software == self.is_software() {
+            return;
+        }
+        if software {
+            let i = self.config.software_effect.unwrap_or(0);
+            self.config.software_effect = Some(i);
+            self.send(Cmd::Software(i));
+        } else {
+            self.config.software_effect = None;
+            self.send(Cmd::Hardware(self.hw_edit));
+        }
+    }
+
+    /// Grava o efeito de fábrica editado, no máximo a cada `HW_APPLY_INTERVAL`.
+    fn apply_hw_if_changed(&mut self) {
+        if self.is_software() || self.hw_edit == self.config.hw || self.last_hw_apply.elapsed() < HW_APPLY_INTERVAL {
+            return;
+        }
+        self.config.hw = self.hw_edit;
+        self.last_hw_apply = Instant::now();
+        self.send(Cmd::Hardware(self.hw_edit));
+        self.config.save();
+    }
+
+    /// Cor que o teclado está mostrando, usada como destaque da interface.
+    fn light_color(&self) -> Rgb {
+        if self.is_software() {
+            self.config.params.primary
+        } else if self.hw_edit.random {
+            [127, 178, 255]
+        } else {
+            self.hw_edit.color
+        }
+    }
+
     fn set_calibration(&mut self, led: Option<usize>) {
         self.calibrating = led;
         self.shared.lock().unwrap().calibrate_led = led;
     }
 
-    /// Avança a calibração pulando LEDs que não existem no fim.
     fn calibration_next(&mut self, from: usize) {
         if from + 1 >= LEDS {
             self.finish_calibration();
@@ -110,13 +172,13 @@ pub fn is_mappable(code: u16) -> bool {
     !matches!(code, KEY_MUTE | KEY_VOLUMEDOWN | KEY_VOLUMEUP) && code != crate::input::KEY_PHANTOM
 }
 
-fn to_color32(c: Rgb) -> Color32 {
-    Color32::from_rgb(c[0], c[1], c[2])
-}
-
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        ui.ctx().request_repaint_after(Duration::from_millis(33));
+        let ctx = ui.ctx().clone();
+        ctx.request_repaint_after(Duration::from_millis(33));
+        if let Some(shot) = self.screenshot.as_mut() {
+            shot.tick(&ctx);
+        }
         self.handle_key_events();
 
         let (status, fps, preview, device_hw) = {
@@ -124,282 +186,393 @@ impl eframe::App for App {
             (sh.status.clone(), sh.fps, sh.preview, sh.device_hw)
         };
         if !self.synced_from_device
-            && let Some(hw) = device_hw {
-                self.hw_edit = hw;
-                self.config.hw = hw;
-                self.synced_from_device = true;
-            }
+            && let Some(hw) = device_hw
+        {
+            self.hw_edit = hw;
+            self.config.hw = hw;
+            self.synced_from_device = true;
+        }
         let (pressed, input_error, input_devices) = {
             let inp = self.input.lock().unwrap();
             (inp.pressed.clone(), inp.error.clone(), inp.devices)
         };
 
-        egui::Panel::top("status").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("keyglow");
-                ui.separator();
-                match &status {
-                    Status::Connected => {
-                        ui.colored_label(Color32::LIGHT_GREEN, "● Teclado conectado");
-                        if self.config.software_effect.is_some() || self.calibrating.is_some() {
-                            ui.label(format!("{fps:.0} quadros/s"));
-                        }
-                    }
-                    Status::Connecting(msg) => {
-                        ui.colored_label(Color32::LIGHT_RED, format!("● {msg}"));
-                    }
-                }
-                ui.separator();
-                match &input_error {
-                    Some(err) if input_devices == 0 => {
-                        ui.colored_label(Color32::YELLOW, format!("Teclas: {err}"));
-                    }
-                    _ => {
-                        ui.label(format!("Teclas: lendo {input_devices} dispositivo(s)"));
-                    }
-                }
-            });
-        });
+        let accent = theme::accent_from(self.light_color());
+        if accent != self.accent {
+            self.accent = accent;
+            theme::set_accent(&ctx, accent);
+        }
 
-        egui::Panel::left("controls").default_size(310.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| self.controls(ui));
-        });
+        egui::Panel::top("header")
+            .frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin::symmetric(24, 14)))
+            .show(ui, |ui| self.header(ui, &status, fps));
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            if let Some(led) = self.calibrating {
-                self.calibration_panel(ui, led);
-                ui.separator();
-            }
-            self.keyboard_view(ui, &preview, &pressed);
-            ui.add_space(8.0);
-            let names: Vec<String> = pressed.iter().map(|&c| key_name(c)).collect();
-            ui.horizontal_wrapped(|ui| {
-                ui.strong("Teclas pressionadas:");
-                if names.is_empty() {
-                    ui.weak("nenhuma");
-                } else {
-                    for n in names {
-                        ui.code(n);
-                    }
-                }
-            });
-        });
+        egui::Panel::bottom("controls")
+            .resizable(false)
+            .exact_size(CONTROLS_HEIGHT)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PANEL)
+                    .inner_margin(Margin { left: 24, right: 24, top: 20, bottom: 16 })
+                    .stroke(Stroke::new(1.0, theme::EDGE)),
+            )
+            .show(ui, |ui| self.controls(ui));
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin::symmetric(24, 8)))
+            .show(ui, |ui| self.hero(ui, &preview, &pressed, input_error.filter(|_| input_devices == 0)));
+
+        self.apply_hw_if_changed();
     }
 }
 
 impl App {
-    fn controls(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Modo");
-        let mut software = self.config.software_effect.is_some();
-        let before = software;
-        ui.radio_value(&mut software, false, "Efeitos do teclado (de fábrica)");
-        ui.radio_value(&mut software, true, "Efeitos do app (tempo real)");
-        if software != before {
-            if software {
-                let i = self.config.software_effect.unwrap_or(0);
-                self.config.software_effect = Some(i);
-                self.send(Cmd::Software(i));
-            } else {
-                self.config.software_effect = None;
-                self.send(Cmd::Hardware(self.hw_edit));
-            }
-        }
-        ui.separator();
+    fn header(&mut self, ui: &mut egui::Ui, status: &Status, fps: f32) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("keyglow").font(semibold(24.0)).color(theme::TEXT));
+            ui.add_space(28.0);
 
-        if software {
-            self.software_controls(ui);
+            let mut software = self.is_software();
+            segmented(ui, &mut software, [(false, "Do teclado"), (true, "Do app")]);
+            self.set_mode(software);
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| match status {
+                Status::Connected => {
+                    if self.is_software() || self.calibrating.is_some() {
+                        ui.label(RichText::new(format!("{fps:.0} quadros/s")).small().weak());
+                    }
+                    ui.label("Teclado conectado");
+                    status_dot(ui, theme::OK);
+                }
+                Status::Connecting(msg) => {
+                    ui.label(RichText::new(msg).color(theme::ERROR));
+                    status_dot(ui, theme::ERROR);
+                }
+            });
+        });
+    }
+
+    fn hero(&mut self, ui: &mut egui::Ui, preview: &[Rgb; LEDS], pressed: &BTreeSet<u16>, input_error: Option<String>) {
+        if let Some(led) = self.calibrating {
+            self.calibration_banner(ui, led);
+        }
+
+        let mapped = self.config.key_to_led.len();
+        let data = ViewData { preview, key_to_led: &self.config.key_to_led, pressed, calibrating: self.calibrating };
+        let max_h = ui.available_height() - 44.0;
+        let view = if self.calibrating.is_none() && mapped >= MIN_MAPPED_FOR_PHYSICAL {
+            keyboard_view::physical(ui, &data, max_h)
         } else {
-            self.hardware_controls(ui);
-        }
+            keyboard_view::matrix(ui, &data, max_h)
+        };
+        self.handle_view_click(view);
 
-        ui.separator();
-        ui.heading("Calibração das teclas");
-        ui.label(format!(
-            "{} teclas mapeadas. Calibre para os efeitos que reagem ao digitar e para os nomes na tela.",
-            self.config.key_to_led.len()
-        ));
+        // Rodapé do teclado: teclas pressionadas e calibração.
         ui.horizontal(|ui| {
-            if self.calibrating.is_none() && ui.button("Calibrar teclas").clicked() {
-                self.set_calibration(Some(0));
+            ui.label(RichText::new("Pressionadas").weak());
+            let keys: Vec<u16> = pressed.iter().copied().filter(|&c| is_mappable(c)).collect();
+            if keys.is_empty() {
+                ui.label(RichText::new("nenhuma tecla").weak());
             }
-            if !self.config.key_to_led.is_empty() && ui.button("Apagar calibração").clicked() {
-                self.config.key_to_led.clear();
-                self.shared.lock().unwrap().key_to_led.clear();
-                self.config.save();
+            for code in keys {
+                key_chip(ui, &legend(code), self.accent);
             }
-        });
-    }
 
-    fn hardware_controls(&mut self, ui: &mut egui::Ui) {
-        ui.label("Gravados no teclado: continuam funcionando com o app fechado.");
-        let hw = &mut self.hw_edit;
-        egui::ComboBox::from_label("Efeito")
-            .selected_text(hw_mode_name(hw.mode))
-            .show_ui(ui, |ui| {
-                for &(value, name) in HW_MODES {
-                    ui.selectable_value(&mut hw.mode, value, name);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.calibrating.is_some() {
+                    return;
+                }
+                let label = if mapped == 0 { "Calibrar teclas" } else { "Recalibrar" };
+                if ui.button(label).clicked() {
+                    self.set_calibration(Some(0));
+                }
+                match &input_error {
+                    Some(err) => {
+                        ui.label(RichText::new(err).color(theme::WARN));
+                    }
+                    None if mapped == 0 => {
+                        ui.label(RichText::new("Calibre para ver o teclado de verdade e usar os efeitos que reagem ao digitar").weak());
+                    }
+                    None => {
+                        ui.label(RichText::new(format!("{mapped} teclas calibradas")).weak());
+                    }
                 }
             });
-        ui.horizontal(|ui| {
-            ui.label("Cor");
-            ui.color_edit_button_srgb(&mut hw.color);
-            ui.checkbox(&mut hw.random, "Cores aleatórias");
         });
-        ui.add(egui::Slider::new(&mut hw.brightness, 0..=4).text("Brilho"));
-        // No firmware, 0 é o mais rápido; na tela, mais alto = mais rápido.
-        let mut speed = 5 - hw.speed.min(5);
-        ui.add(egui::Slider::new(&mut speed, 0..=5).text("Velocidade"));
-        hw.speed = 5 - speed;
-        let mut reverse = hw.direction != 0;
-        ui.checkbox(&mut reverse, "Inverter direção");
-        hw.direction = reverse as u8;
+    }
 
-        let changed = self.hw_edit != self.config.hw;
-        if ui.add_enabled(changed, egui::Button::new("Aplicar no teclado")).clicked() {
-            self.config.hw = self.hw_edit;
-            self.send(Cmd::Hardware(self.hw_edit));
-            self.config.save();
+    fn handle_view_click(&mut self, view: keyboard_view::ViewResponse) {
+        let Some(led) = view.led else { return };
+        if self.calibrating.is_some() {
+            if view.clicked {
+                self.set_calibration(Some(led));
+            }
+        } else if self.is_painting() && (view.clicked || view.dragged) {
+            self.config.params.paint[led] = self.brush;
+            self.shared.lock().unwrap().params = self.config.params.clone();
         }
     }
 
-    fn software_controls(&mut self, ui: &mut egui::Ui) {
-        ui.label("Calculados pelo app: só funcionam com ele aberto.");
-        let current = self.config.software_effect.unwrap_or(0);
-        for (i, effect) in EFFECTS.iter().enumerate() {
-            if ui.selectable_label(i == current, effect.name).on_hover_text(effect.description).clicked() && i != current {
-                self.config.software_effect = Some(i);
-                self.send(Cmd::Software(i));
-            }
-        }
-        if let Some(effect) = EFFECTS.get(current) {
-            ui.weak(effect.description);
-        }
-        ui.separator();
+    fn is_painting(&self) -> bool {
+        self.config.software_effect.and_then(|i| EFFECTS.get(i)).is_some_and(|e| e.name == "Pintura")
+    }
 
-        let p = &mut self.config.params;
-        ui.horizontal(|ui| {
-            ui.label("Cor principal");
-            ui.color_edit_button_srgb(&mut p.primary);
-        });
-        ui.horizontal(|ui| {
-            ui.label("Cor de fundo");
-            ui.color_edit_button_srgb(&mut p.secondary);
-        });
-        ui.add(egui::Slider::new(&mut p.speed, 0.1..=3.0).text("Velocidade"));
-        ui.add(egui::Slider::new(&mut p.brightness, 0.0..=1.0).text("Brilho"));
+    fn calibration_banner(&mut self, ui: &mut egui::Ui, led: usize) {
+        let (row, col) = row_col(led);
+        egui::Frame::new()
+            .fill(theme::PANEL)
+            .stroke(Stroke::new(1.0, theme::WARN))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::symmetric(18, 14))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(format!("Calibrando a posição {} de {LEDS}", led + 1)).font(semibold(17.0)));
+                        ui.label(format!(
+                            "Aperte a tecla que está piscando no teclado (linha {}, coluna {}). Se nada piscar, gire o volume para cima para pular.",
+                            row + 1,
+                            col + 1
+                        ));
+                        let last = match self.last_mapped {
+                            Some((code, l)) => {
+                                let (r, c) = row_col(l);
+                                format!("Última calibrada: {} na linha {}, coluna {}", legend(code), r + 1, c + 1)
+                            }
+                            None => "Volume para baixo volta uma posição. Clique numa posição da grade para ir direto até ela.".into(),
+                        };
+                        ui.label(RichText::new(last).weak());
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Concluir").clicked() {
+                            self.finish_calibration();
+                        }
+                        if ui.button("Pular linha").clicked() {
+                            let next = (row + 1) * COLS;
+                            if next >= LEDS { self.finish_calibration() } else { self.set_calibration(Some(next)) }
+                        }
+                        if ui.button("Pular").clicked() {
+                            self.calibration_next(led);
+                        }
+                    });
+                });
+            });
+        ui.add_space(6.0);
+    }
 
-        if EFFECTS.get(current).is_some_and(|e| e.name == "Pintura") {
+    fn controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_top(|ui| {
+            // Grade de efeitos: cabe inteira, sem rolagem.
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Efeitos").font(semibold(16.0)));
+                ui.add_space(2.0);
+                let accent = self.accent;
+                if self.is_software() {
+                    let current = self.config.software_effect.unwrap_or(0);
+                    let names: Vec<&str> = EFFECTS.iter().map(|e| e.name).collect();
+                    if let Some(i) = effect_grid(ui, "sw_effects", &names, Some(current), 2, accent)
+                        && i != current
+                    {
+                        self.config.software_effect = Some(i);
+                        self.send(Cmd::Software(i));
+                    }
+                } else {
+                    let names: Vec<&str> = HW_MODES.iter().map(|(_, n)| *n).collect();
+                    let current = HW_MODES.iter().position(|(m, _)| *m == self.hw_edit.mode);
+                    if let Some(i) = effect_grid(ui, "hw_effects", &names, current, 3, accent) {
+                        self.hw_edit.mode = HW_MODES[i].0;
+                    }
+                }
+            });
+
+            ui.add_space(20.0);
             ui.separator();
-            ui.horizontal(|ui| {
-                ui.label("Pincel");
-                ui.color_edit_button_srgb(&mut self.brush);
-                if ui.button("Pintar tudo").clicked() {
-                    p.paint = vec![self.brush; LEDS];
+            ui.add_space(20.0);
+
+            ui.vertical(|ui| {
+                if self.is_software() {
+                    self.software_settings(ui);
+                } else {
+                    self.hardware_settings(ui);
                 }
             });
-            ui.weak("Clique ou arraste sobre as teclas da tela.");
+        });
+    }
+
+    fn hardware_settings(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new(hw_mode_name(self.hw_edit.mode)).font(semibold(20.0)));
+        ui.label(RichText::new("Fica gravado no teclado e continua funcionando com o keyglow fechado.").weak());
+        ui.add_space(8.0);
+
+        let hw = &mut self.hw_edit;
+        egui::Grid::new("hw_settings").num_columns(2).spacing([28.0, 14.0]).show(ui, |ui| {
+            ui.label(RichText::new("Cor").weak());
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!hw.random, |ui| color_button(ui, &mut hw.color));
+                ui.checkbox(&mut hw.random, "Cores aleatórias");
+            });
+            ui.end_row();
+
+            ui.label(RichText::new("Brilho").weak());
+            ui.add(egui::Slider::new(&mut hw.brightness, 0..=4).show_value(false));
+            ui.end_row();
+
+            // No firmware, 0 é o mais rápido; na tela, para a direita = mais rápido.
+            ui.label(RichText::new("Velocidade").weak());
+            let mut speed = 5 - hw.speed.min(5);
+            ui.add(egui::Slider::new(&mut speed, 0..=5).show_value(false));
+            hw.speed = 5 - speed;
+            ui.end_row();
+
+            ui.label(RichText::new("Direção").weak());
+            let mut reverse = hw.direction != 0;
+            segmented(ui, &mut reverse, [(false, "Normal"), (true, "Invertida")]);
+            hw.direction = reverse as u8;
+            ui.end_row();
+        });
+    }
+
+    fn software_settings(&mut self, ui: &mut egui::Ui) {
+        let Some(effect) = self.config.software_effect.and_then(|i| EFFECTS.get(i)) else { return };
+        ui.label(RichText::new(effect.name).font(semibold(20.0)));
+        ui.label(RichText::new(effect.description).weak());
+        ui.add_space(8.0);
+
+        let painting = self.is_painting();
+        let p = &mut self.config.params;
+        egui::Grid::new("sw_settings").num_columns(2).spacing([28.0, 14.0]).show(ui, |ui| {
+            if painting {
+                ui.label(RichText::new("Pincel").weak());
+                ui.horizontal(|ui| {
+                    color_button(ui, &mut self.brush);
+                    if ui.button("Pintar todas as teclas").clicked() {
+                        p.paint = vec![self.brush; LEDS];
+                    }
+                });
+                ui.end_row();
+            }
+            for control in effect.controls {
+                match *control {
+                    Control::Primary(label) => {
+                        ui.label(RichText::new(label).weak());
+                        color_button(ui, &mut p.primary);
+                    }
+                    Control::Secondary(label) => {
+                        ui.label(RichText::new(label).weak());
+                        color_button(ui, &mut p.secondary);
+                    }
+                    Control::Speed => {
+                        ui.label(RichText::new("Velocidade").weak());
+                        ui.add(egui::Slider::new(&mut p.speed, 0.1..=3.0).custom_formatter(|v, _| format!("{v:.1}×")));
+                    }
+                }
+                ui.end_row();
+            }
+
+            ui.label(RichText::new("Brilho").weak());
+            ui.add(egui::Slider::new(&mut p.brightness, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+            ui.end_row();
+        });
+        if painting {
+            ui.label(RichText::new("Clique ou arraste sobre as teclas para pintar.").weak());
         }
         self.shared.lock().unwrap().params = self.config.params.clone();
     }
-
-    fn calibration_panel(&mut self, ui: &mut egui::Ui, led: usize) {
-        let (row, col) = row_col(led);
-        ui.heading(format!("Calibrando: LED {} de {LEDS} (linha {}, coluna {})", led + 1, row + 1, col + 1));
-        ui.label("Aperte a tecla que está piscando em branco no teclado. As já calibradas ficam verdes.");
-        ui.label("Nada piscando? Essa posição não tem LED: gire o volume para cima para pular (para baixo volta).");
-        ui.weak("Dica: clique em uma posição da tela para ir direto até ela.");
-        if let Some((code, l)) = self.last_mapped {
-            let (r, c) = row_col(l);
-            ui.label(format!("Última: {} → linha {}, coluna {}", key_name(code), r + 1, c + 1));
-        }
-        ui.horizontal(|ui| {
-            if ui.button("Pular (sem tecla)").clicked() {
-                self.calibration_next(led);
-            }
-            if ui.button("Pular resto da linha").clicked() {
-                let next_row_start = (row + 1) * COLS;
-                if next_row_start >= LEDS {
-                    self.finish_calibration();
-                } else {
-                    self.set_calibration(Some(next_row_start));
-                }
-            }
-            if led > 0 && ui.button("Voltar").clicked() {
-                self.set_calibration(Some(led - 1));
-            }
-            if ui.button("Concluir").clicked() {
-                self.finish_calibration();
-            }
-        });
-    }
-
-    /// Desenha a matriz 6x21 com as cores atuais e as teclas pressionadas.
-    fn keyboard_view(&mut self, ui: &mut egui::Ui, preview: &[Rgb; LEDS], pressed: &std::collections::BTreeSet<u16>) {
-        let led_to_key = self.config.led_to_key();
-        let width = ui.available_width();
-        let cell = (width / COLS as f32).clamp(24.0, 60.0);
-        let size = Vec2::new(cell * COLS as f32, cell * ROWS as f32);
-        let (response, painter) = ui.allocate_painter(size, Sense::click_and_drag());
-        let origin = response.rect.min;
-        let pressed_leds: Vec<usize> = pressed.iter().filter_map(|c| self.config.key_to_led.get(c).copied()).collect();
-
-        for led in 0..LEDS {
-            let (row, col) = row_col(led);
-            let rect = Rect::from_min_size(
-                origin + Vec2::new(col as f32 * cell, row as f32 * cell),
-                Vec2::splat(cell),
-            )
-            .shrink(2.0);
-            let color = preview[led];
-            painter.rect_filled(rect, 4.0, to_color32(color));
-
-            let is_pressed = pressed_leds.contains(&led);
-            let stroke = if self.calibrating == Some(led) {
-                Stroke::new(3.0, Color32::YELLOW)
-            } else if self.calibrating.is_some() && led_to_key.contains_key(&led) {
-                Stroke::new(2.0, Color32::LIGHT_GREEN)
-            } else if is_pressed {
-                Stroke::new(3.0, Color32::WHITE)
-            } else {
-                Stroke::new(1.0, Color32::from_gray(60))
-            };
-            painter.rect_stroke(rect, 4.0, stroke, StrokeKind::Inside);
-
-            if let Some(&code) = led_to_key.get(&led) {
-                let luma = 0.299 * color[0] as f32 + 0.587 * color[1] as f32 + 0.114 * color[2] as f32;
-                let text = if luma > 140.0 { Color32::BLACK } else { Color32::WHITE };
-                painter.text(rect.center(), Align2::CENTER_CENTER, key_name(code), FontId::proportional(cell * 0.28), text);
-            }
-        }
-
-        let Some(led) = response.interact_pointer_pos().and_then(|pos| led_at(origin, cell, pos)) else {
-            return;
-        };
-        let painting = self.config.software_effect.and_then(|i| EFFECTS.get(i)).is_some_and(|e| e.name == "Pintura");
-        if self.calibrating.is_some() {
-            // Na calibração, clicar leva direto àquela posição.
-            if response.clicked() {
-                self.set_calibration(Some(led));
-            }
-        } else if painting {
-            if response.clicked() || response.dragged() {
-                self.config.params.paint[led] = self.brush;
-                self.shared.lock().unwrap().params = self.config.params.clone();
-            }
-        } else if response.clicked() {
-            // Fora da pintura: clicar numa posição recalibra a partir dela.
-            self.set_calibration(Some(led));
-        }
-    }
 }
 
-fn led_at(origin: Pos2, cell: f32, pos: Pos2) -> Option<usize> {
-    let d = pos - origin;
-    if d.x < 0.0 || d.y < 0.0 {
-        return None;
+// ---------------------------------------------------------------------------
+// Componentes
+
+/// Controle segmentado de duas opções.
+fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options: [(T, &str); 2]) {
+    egui::Frame::new()
+        .fill(theme::DECK)
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::same(3))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.horizontal(|ui| {
+                for (option, label) in options {
+                    let selected = *value == option;
+                    let text = RichText::new(label).color(if selected { theme::TEXT } else { theme::MUTED });
+                    let button = egui::Button::new(text)
+                        .fill(if selected { theme::RAISED } else { Color32::TRANSPARENT })
+                        .stroke(Stroke::NONE)
+                        .corner_radius(CornerRadius::same(6))
+                        .min_size(Vec2::new(104.0, 28.0));
+                    if ui.add(button).clicked() {
+                        *value = option;
+                    }
+                }
+            });
+        });
+}
+
+/// Grade de efeitos em colunas; devolve o índice clicado.
+fn effect_grid(ui: &mut egui::Ui, id: &str, names: &[&str], selected: Option<usize>, columns: usize, accent: Color32) -> Option<usize> {
+    let mut clicked = None;
+    egui::Grid::new(id).num_columns(columns).spacing([4.0, 2.0]).show(ui, |ui| {
+        for (i, name) in names.iter().enumerate() {
+            if effect_row(ui, selected == Some(i), name, accent).clicked() {
+                clicked = Some(i);
+            }
+            if (i + 1) % columns == 0 {
+                ui.end_row();
+            }
+        }
+    });
+    clicked
+}
+
+/// Item da grade de efeitos; o selecionado ganha uma barra com a cor da luz.
+fn effect_row(ui: &mut egui::Ui, selected: bool, name: &str, accent: Color32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(176.0, 32.0), Sense::click());
+    let fill = if selected {
+        theme::RAISED
+    } else if response.hovered() {
+        theme::mix(theme::PANEL, theme::RAISED, 0.5)
+    } else {
+        Color32::TRANSPARENT
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(6), fill);
+    if selected {
+        let bar = egui::Rect::from_min_size(rect.min + Vec2::new(0.0, 7.0), Vec2::new(3.0, rect.height() - 14.0));
+        painter.rect_filled(bar, CornerRadius::same(2), accent);
     }
-    let (col, row) = ((d.x / cell) as usize, (d.y / cell) as usize);
-    (col < COLS && row < ROWS).then_some(row * COLS + col)
+    painter.text(
+        rect.left_center() + Vec2::new(14.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        name,
+        egui::FontId::proportional(14.5),
+        if selected { theme::TEXT } else { theme::MUTED },
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+fn key_chip(ui: &mut egui::Ui, text: &str, accent: Color32) {
+    let text = if text.is_empty() { "Espaço" } else { text };
+    egui::Frame::new()
+        .fill(theme::RAISED)
+        .stroke(Stroke::new(1.0, theme::with_alpha(accent, 0.6)))
+        .corner_radius(CornerRadius::same(5))
+        .inner_margin(Margin::symmetric(8, 2))
+        .show(ui, |ui| ui.label(RichText::new(text).font(semibold(13.0))));
+}
+
+/// Botão de cor com borda, para cores claras não sumirem no fundo.
+fn color_button(ui: &mut egui::Ui, color: &mut Rgb) -> egui::Response {
+    let response = ui.color_edit_button_srgb(color);
+    ui.painter().rect_stroke(response.rect, CornerRadius::same(4), Stroke::new(1.0, theme::EDGE), egui::StrokeKind::Outside);
+    response
+}
+
+fn status_dot(ui: &mut egui::Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.0, color);
 }
 
 impl Drop for App {

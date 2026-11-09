@@ -112,6 +112,8 @@ pub fn spawn(
 impl Engine {
     fn run(&mut self) {
         let mut last = Instant::now();
+        // Contagem real de quadros por segundo (para a interface).
+        let (mut frames, mut window) = (0u32, Instant::now());
         loop {
             let start = Instant::now();
             let dt = start.duration_since(last).as_secs_f32();
@@ -146,9 +148,10 @@ impl Engine {
             if let Some(rest) = FRAME_TIME.checked_sub(start.elapsed()) {
                 thread::sleep(rest);
             }
-            if dt > 0.0 {
-                let mut sh = self.shared.lock().unwrap();
-                sh.fps = sh.fps * 0.9 + (1.0 / dt) * 0.1;
+            frames += 1;
+            if window.elapsed() >= Duration::from_secs(1) {
+                self.shared.lock().unwrap().fps = frames as f32 / window.elapsed().as_secs_f32();
+                (frames, window) = (0, Instant::now());
             }
         }
     }

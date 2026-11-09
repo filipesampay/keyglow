@@ -6,17 +6,23 @@
 //! onde o checksum é a soma (u16) dos bytes 3..64.
 //!
 //! Modelos:
-//! - `320f:5016`: testado. Os números dos modos de fábrica são os do OpenRGB
+//! - `320f:5016` (Husky Anchorage HTG200): testado. Os números dos modos de fábrica são os do OpenRGB
 //!   menos 1 (5 = fixo, 0x13 = custom).
 //! - `320f:5041` e `3299:0012` (Endorfy Omnis): suportados pelo OpenRGB,
 //!   não testados aqui; usam a numeração do OpenRGB.
+//! - `0c45:8501` (Husky Sled HTG500): mesmo protocolo, numeração do OpenRGB; não testado.
 //! - Outros `320f`/`3299` com a interface 0xFF1C: não testados. Ao abrir,
 //!   o keyglow lê as capacidades (comando só de leitura) e só segue se o
 //!   firmware responder como EVision V2.
 //! - Os modelos "EVision V1" do OpenRGB usam outro protocolo e são ignorados.
+//!
+//! Além da luz, alguns modelos guardam na memória o que cada tecla faz e
+//! macros (formatos em [`crate::onboard`]). Isso só é liberado nos modelos
+//! da tabela marcados com `onboard`.
 
-use super::{DeviceEntry, Driver, Grid, HwMode, Kind, Rgb, Source};
+use super::{DeviceEntry, Driver, Grid, HwMode, Kind, Onboard, Rgb, Source};
 use crate::hid::{HidInfo, HidIo, Port};
+use crate::onboard::{self, Cell};
 use std::collections::BTreeMap;
 use std::io;
 use std::time::Duration;
@@ -35,13 +41,23 @@ struct Model {
     /// Valor no firmware = número do modo no keyglow + `mode_offset`.
     mode_offset: u8,
     tested: bool,
+    /// Mapa de teclas e macros na memória do teclado (matriz 6 x 21).
+    onboard: bool,
 }
 
 const MODELS: &[Model] = &[
-    Model { vid: 0x320F, pid: 0x5016, name: "Teclado EVision 320f:5016", mode_offset: 0, tested: true },
-    Model { vid: 0x320F, pid: 0x5041, name: "Teclado EVision 320f:5041", mode_offset: 1, tested: false },
-    Model { vid: 0x3299, pid: 0x0012, name: "Endorfy Omnis", mode_offset: 1, tested: false },
+    Model { vid: 0x320F, pid: 0x5016, name: "Husky Anchorage HTG200", mode_offset: 0, tested: true, onboard: true },
+    Model { vid: 0x320F, pid: 0x5041, name: "Teclado EVision 320f:5041", mode_offset: 1, tested: false, onboard: false },
+    Model { vid: 0x3299, pid: 0x0012, name: "Endorfy Omnis", mode_offset: 1, tested: false, onboard: false },
+    // Mesmo protocolo com outro ID USB. A numeração dos modos começa em 1
+    // (0 = luz apagada); se o modo direto usa 0x14 nele ainda não foi visto
+    // num teclado de verdade.
+    Model { vid: 0x0C45, pid: 0x8501, name: "Husky Sled HTG500", mode_offset: 1, tested: false, onboard: true },
 ];
+
+fn find_model(vid: u16, pid: u16) -> Option<&'static Model> {
+    MODELS.iter().find(|m| m.vid == vid && m.pid == pid)
+}
 
 /// Modelos desconhecidos seguem a numeração do OpenRGB.
 const UNKNOWN_MODE_OFFSET: u8 = 1;
@@ -62,24 +78,34 @@ mod cmd {
     /// Cores enviadas em tempo real pelo software.
     pub const DIRECT: u8 = 0x12;
     pub const END_DIRECT: u8 = 0x13;
+    /// Tabela de teclas (378 bytes, coluna por coluna).
+    pub const READ_KEYS: u8 = 0x08;
+    pub const WRITE_KEYS: u8 = 0x09;
+    /// Volta luz, teclas e macros ao padrão de fábrica.
+    pub const FACTORY_RESET: u8 = 0x0D;
+    /// Bloco de macros.
+    pub const READ_MACROS: u8 = 0x14;
+    pub const WRITE_MACROS: u8 = 0x15;
 }
 
 const OFF_CURRENT_PROFILE: u16 = 0x00;
 const OFF_FIRST_PROFILE: u16 = 0x01;
 const PROFILE_STRIDE: u16 = 0x40;
 
-/// Modo "Custom" do firmware. Com ele ativo, o modo direto fica estável.
+/// Modo em que o firmware não desenha efeito nenhum (no 320f:5016, o valor
+/// que apaga a luz). Com ele ativo, o modo direto fica estável, porque só as
+/// cores mandadas pelo app aparecem.
 pub const MODE_CUSTOM: u8 = 0x13;
 pub const MODE_STATIC: u8 = 5;
 /// O firmware sai do modo direto se ficar ~0,5 s sem imagens.
 const KEEPALIVE: Duration = Duration::from_millis(150);
 
-/// Efeitos de fábrica (número no keyglow, nome). Os nomes vêm do OpenRGB;
-/// confirmados na prática no 320f:5016: 5, 6 e 7.
+/// Efeitos de fábrica (número no keyglow, nome). Confirmados na prática no
+/// 320f:5016: 5, 6 e 7.
 pub const HW_MODES: &[(u8, &str)] = &[
     (0, "Onda curta"),
     (1, "Onda longa"),
-    (2, "Caminhos (zig-zag?)"),
+    (2, "Difusão"),
     (3, "Espectro"),
     (4, "Respiração"),
     (5, "Fixo"),
@@ -93,7 +119,7 @@ pub const HW_MODES: &[(u8, &str)] = &[
     (13, "Acumular"),
     (14, "Estrelas lentas"),
     (15, "Vai e volta"),
-    (16, "Surmount"),
+    (16, "Apagar ao digitar"),
     (17, "Círculo arco-íris"),
 ];
 
@@ -108,10 +134,11 @@ pub fn hw_mode_name(mode: u8) -> String {
 /// Reconhece a interface de controle de um teclado EVision V2 só pelos
 /// dados da enumeração (não abre nada).
 pub fn recognize(info: &HidInfo) -> Option<DeviceEntry> {
-    if info.usage_page != CONTROL_USAGE_PAGE || !EVISION_VIDS.contains(&info.vid) || V1_MODELS.contains(&(info.vid, info.pid)) {
+    let model = find_model(info.vid, info.pid);
+    let known_vendor = EVISION_VIDS.contains(&info.vid) || model.is_some();
+    if info.usage_page != CONTROL_USAGE_PAGE || !known_vendor || V1_MODELS.contains(&(info.vid, info.pid)) {
         return None;
     }
-    let model = MODELS.iter().find(|m| m.vid == info.vid && m.pid == info.pid);
     let name = match model {
         Some(m) => m.name.to_string(),
         None if !info.product.is_empty() => format!("{} ({:04x}:{:04x})", info.product, info.vid, info.pid),
@@ -133,14 +160,19 @@ pub struct Evision {
     map_size: usize,
     grid: Grid,
     is_5016: bool,
+    /// O modelo guarda teclas e macros no formato que o keyglow conhece.
+    onboard: bool,
+    firmware: Option<u16>,
 }
 
 impl Evision {
     pub fn open(info: &HidInfo) -> io::Result<Self> {
-        let model = MODELS.iter().find(|m| m.vid == info.vid && m.pid == info.pid);
+        let model = find_model(info.vid, info.pid);
         let port = Box::new(Port::open(info)?);
         let mut kb = Self::with_io(port, model.map_or(UNKNOWN_MODE_OFFSET, |m| m.mode_offset));
         kb.is_5016 = (info.vid, info.pid) == (0x320F, 0x5016);
+        kb.onboard = model.is_some_and(|m| m.onboard);
+        kb.firmware = (info.release != 0).then_some(info.release);
         if !kb.is_5016 {
             kb.check_capabilities()?;
         }
@@ -148,7 +180,15 @@ impl Evision {
     }
 
     pub fn with_io(port: Box<dyn HidIo>, mode_offset: u8) -> Self {
-        Self { port, mode_offset, map_size: ROWS * COLS, grid: Grid::full(ROWS, COLS), is_5016: false }
+        Self {
+            port,
+            mode_offset,
+            map_size: ROWS * COLS,
+            grid: Grid::full(ROWS, COLS),
+            is_5016: false,
+            onboard: false,
+            firmware: None,
+        }
     }
 
     /// Confirma que o firmware fala EVision V2 (resposta `AA 55`) e lê
@@ -164,8 +204,7 @@ impl Evision {
         Ok(())
     }
 
-    /// Envia um pacote e espera a resposta correspondente.
-    fn query(&mut self, command: u8, offset: u16, data: &[u8], size: u8) -> io::Result<Vec<u8>> {
+    fn packet(command: u8, offset: u16, data: &[u8], size: u8) -> [u8; PACKET] {
         debug_assert!(data.len() <= MAX_PAYLOAD);
         let mut buf = [0u8; PACKET];
         buf[0] = REPORT_ID;
@@ -177,7 +216,12 @@ impl Evision {
         let sum = buf[3..].iter().fold(0u16, |acc, &b| acc.wrapping_add(b as u16));
         buf[1] = (sum & 0xFF) as u8;
         buf[2] = (sum >> 8) as u8;
+        buf
+    }
 
+    /// Envia um pacote e espera a resposta correspondente.
+    fn query(&mut self, command: u8, offset: u16, data: &[u8], size: u8) -> io::Result<Vec<u8>> {
+        let buf = Self::packet(command, offset, data, size);
         self.port.write(&buf)?;
 
         // A mesma interface também manda eventos do botão de volume
@@ -263,6 +307,59 @@ impl Evision {
     fn end_direct(&mut self) -> io::Result<()> {
         self.query(cmd::END_DIRECT, 0, &[], 0).map(|_| ())
     }
+
+    #[cfg(test)]
+    pub fn enable_onboard_for_tests(&mut self) {
+        self.onboard = true;
+    }
+
+    /// Grava entre os comandos de início e fim, como nos efeitos de fábrica.
+    fn write_wrapped(&mut self, command: u8, data: &[u8]) -> io::Result<()> {
+        self.query(cmd::BEGIN, 0, &[], 0)?;
+        let result = self.write(command, 0, data);
+        self.query(cmd::END, 0, &[], 0)?;
+        result
+    }
+}
+
+impl Onboard for Evision {
+    fn read_keys(&mut self) -> io::Result<Vec<Cell>> {
+        let raw = self.read(cmd::READ_KEYS, 0, onboard::TABLE_LEN)?;
+        onboard::table_from_firmware(&raw).ok_or_else(|| io::Error::other("tabela de teclas incompleta"))
+    }
+
+    fn write_keys(&mut self, cells: &[Cell]) -> io::Result<()> {
+        if cells.len() != onboard::SLOTS {
+            return Err(io::Error::other("tabela de teclas com tamanho errado"));
+        }
+        self.write_wrapped(cmd::WRITE_KEYS, &onboard::table_to_firmware(cells))
+    }
+
+    fn read_macros(&mut self) -> io::Result<Vec<u8>> {
+        let mut block = self.read(cmd::READ_MACROS, 0, MAX_PAYLOAD)?;
+        if let Some(len) = onboard::macro_block_len(&block)
+            && len > block.len()
+        {
+            let rest = self.read(cmd::READ_MACROS, block.len() as u16, len - block.len())?;
+            block.extend_from_slice(&rest);
+        }
+        Ok(block)
+    }
+
+    fn write_macros(&mut self, block: &[u8]) -> io::Result<()> {
+        if onboard::macro_block_len(block) != Some(block.len()) {
+            return Err(io::Error::other("bloco de macros inválido"));
+        }
+        self.write_wrapped(cmd::WRITE_MACROS, block)
+    }
+
+    /// O teclado pode reiniciar sem responder; basta o pedido ter saído.
+    fn factory_reset(&mut self) -> io::Result<()> {
+        self.port.write(&Self::packet(cmd::FACTORY_RESET, 0, &[], 0))?;
+        let mut resp = [0u8; PACKET];
+        let _ = self.port.read_timeout(&mut resp, TIMEOUT_MS);
+        Ok(())
+    }
 }
 
 impl Driver for Evision {
@@ -317,6 +414,14 @@ impl Driver for Evision {
 
     fn default_key_map(&self) -> BTreeMap<u16, usize> {
         if self.is_5016 { crate::default_layout::default_key_to_led() } else { BTreeMap::new() }
+    }
+
+    fn onboard(&mut self) -> Option<&mut dyn Onboard> {
+        (self.onboard && self.map_size == onboard::SLOTS).then_some(self as &mut dyn Onboard)
+    }
+
+    fn firmware_version(&self) -> Option<u16> {
+        self.firmware
     }
 }
 
@@ -390,9 +495,93 @@ mod tests {
         assert!(kb.check_capabilities().is_err());
     }
 
+    fn onboard_kb(writes: &Arc<Mutex<Vec<Vec<u8>>>>) -> Evision {
+        let mut kb = Evision::with_io(Box::new(MockEvision::new(Arc::clone(writes))), 0);
+        kb.onboard = true;
+        kb
+    }
+
+    /// Lê e grava teclas e macros e pede o reset de fábrica. Os bytes ficam
+    /// guardados em `testdata/evision_onboard.hex`.
+    #[test]
+    fn golden_onboard() {
+        use crate::onboard::{encode_macros, KeyAction, MacroInput, MacroStep};
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let mut kb = onboard_kb(&writes);
+        let ob = kb.onboard().unwrap();
+
+        let mut keys = ob.read_keys().unwrap();
+        assert_eq!(KeyAction::decode(keys[110]), KeyAction::Fn);
+        keys[64] = KeyAction::Media(0x00CD).encode();
+        ob.write_keys(&keys).unwrap();
+        assert_eq!(ob.read_keys().unwrap(), keys);
+
+        assert_eq!(crate::onboard::decode_macros(&ob.read_macros().unwrap()).unwrap(), Vec::<crate::onboard::Macro>::new());
+        let m = vec![
+            MacroStep { input: MacroInput::Key(0x04), press: true, delay_ms: 20 },
+            MacroStep { input: MacroInput::Key(0x04), press: false, delay_ms: 20 },
+        ];
+        // Duas macros, a segunda longa o bastante para ocupar mais de um pacote.
+        let block = encode_macros(&[m.clone(), m.repeat(10)]);
+        assert!(block.len() > MAX_PAYLOAD);
+        ob.write_macros(&block).unwrap();
+        assert_eq!(ob.read_macros().unwrap(), block);
+
+        ob.factory_reset().unwrap();
+        check_golden("evision_onboard.hex", &writes.lock().unwrap());
+    }
+
+    /// Escrita da tabela: início, 7 pacotes de até 56 bytes (a tabela tem
+    /// 378) com o deslocamento de cada um, e fim.
+    #[test]
+    fn key_table_packets() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let mut kb = onboard_kb(&writes);
+        let ob = kb.onboard().unwrap();
+        let keys = ob.read_keys().unwrap();
+        writes.lock().unwrap().clear();
+        ob.write_keys(&keys).unwrap();
+        let w = writes.lock().unwrap();
+        let cmds: Vec<(u8, u8, u16)> = w.iter().map(|p| (p[3], p[4], u16::from_le_bytes([p[5], p[6]]))).collect();
+        let mut expected = vec![(cmd::BEGIN, 0, 0)];
+        for i in 0..7u16 {
+            expected.push((cmd::WRITE_KEYS, if i == 6 { 42 } else { 56 }, i * 56));
+        }
+        expected.push((cmd::END, 0, 0));
+        assert_eq!(cmds, expected);
+        // Checksum: soma dos bytes 3..64.
+        for p in w.iter() {
+            let sum = p[3..].iter().fold(0u16, |a, &b| a.wrapping_add(b as u16));
+            assert_eq!(u16::from_le_bytes([p[1], p[2]]), sum);
+        }
+    }
+
+    #[test]
+    fn onboard_only_on_known_models() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let mut kb = Evision::with_io(Box::new(MockEvision::new(Arc::clone(&writes))), 1);
+        assert!(kb.onboard().is_none());
+        kb.onboard = true;
+        kb.map_size = 100;
+        assert!(kb.onboard().is_none(), "matriz diferente de 6 x 21");
+        let mut bad = onboard_kb(&writes);
+        assert!(bad.onboard().unwrap().write_macros(&[0xAA, 0x55, 99, 0]).is_err());
+        assert!(bad.onboard().unwrap().write_keys(&[[0; 3]; 3]).is_err());
+    }
+
+    #[test]
+    fn recognizes_models_outside_the_usual_vendors() {
+        let info = HidInfo { path: "x".into(), vid: 0x0C45, pid: 0x8501, usage_page: 0xFF1C, usage: 0x92, product: String::new(), release: 0 };
+        let e = recognize(&info).unwrap();
+        assert!(!e.tested);
+        assert_eq!(e.id, "evision:0c45:8501");
+        // Outros dispositivos do mesmo fabricante de chip não entram.
+        assert!(recognize(&HidInfo { pid: 0x7000, ..info }).is_none());
+    }
+
     #[test]
     fn recognizes_only_v2_control_interface() {
-        let info = |vid, pid, page| HidInfo { path: "x".into(), vid, pid, usage_page: page, usage: 0x92, product: String::new() };
+        let info = |vid, pid, page| HidInfo { path: "x".into(), vid, pid, usage_page: page, usage: 0x92, product: String::new(), release: 0 };
         let e = recognize(&info(0x320F, 0x5016, 0xFF1C)).unwrap();
         assert!(e.tested);
         assert_eq!(e.id, "evision:320f:5016");

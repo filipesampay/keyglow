@@ -4,6 +4,11 @@
 //! - topo: nome, seletor "Do teclado | Do app", escolha do teclado e status;
 //! - centro: o teclado desenhado, com a luz atual e as teclas pressionadas;
 //! - base: lista de efeitos à esquerda e ajustes do efeito à direita.
+//!
+//! Nos teclados que guardam teclas e macros, o topo ganha as abas Teclas,
+//! Macros e Teclado (`onboard_ui`).
+
+mod onboard_ui;
 
 use crate::config::{Config, DeviceConfig, LEGACY_DEVICE};
 use crate::drivers::evision::hw_mode_name;
@@ -13,6 +18,7 @@ use crate::engine::{Cmd, DeviceView, Shared, Status};
 use crate::input::InputState;
 use crate::keyboard_view::{self, legend, ViewData};
 use crate::theme::{self, semibold};
+use onboard_ui::{OnboardUi, Page};
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Sense, Stroke, Vec2};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::Sender;
@@ -51,6 +57,10 @@ pub struct App {
     last_mapped: Option<(u16, usize)>,
     accent: Color32,
     screenshot: Option<crate::screenshot::Screenshot>,
+    /// Telas de teclas, macros e teclado.
+    ob: OnboardUi,
+    /// Última conexão vista (a cada uma, relê o efeito do teclado).
+    connections_seen: u64,
 }
 
 impl App {
@@ -97,6 +107,8 @@ impl App {
             last_mapped: None,
             accent: Color32::TRANSPARENT,
             screenshot: crate::screenshot::Screenshot::from_env(),
+            ob: OnboardUi::default(),
+            connections_seen: 0,
         }
     }
 
@@ -136,8 +148,9 @@ impl App {
     /// Guarda a calibração e a pintura do teclado atual na configuração.
     fn store_device(&mut self) {
         if let Some(d) = &self.device {
-            let cfg = DeviceConfig { key_to_led: self.key_to_led.clone(), paint: self.config.params.paint.clone() };
-            self.config.devices.insert(d.entry.id.clone(), cfg);
+            let cfg: &mut DeviceConfig = self.config.devices.entry(d.entry.id.clone()).or_default();
+            cfg.key_to_led = self.key_to_led.clone();
+            cfg.paint = self.config.params.paint.clone();
         }
     }
 
@@ -171,6 +184,7 @@ impl App {
         self.synced_from_device = false;
         self.calibrating = None;
         self.last_mapped = None;
+        self.ob.reset_device();
         let mut sh = self.shared.lock().unwrap();
         sh.key_to_led = self.key_to_led.clone();
         sh.params = self.config.params.clone();
@@ -223,6 +237,10 @@ impl App {
 
     fn handle_key_events(&mut self) {
         let events = std::mem::take(&mut self.input.lock().unwrap().gui_events);
+        if self.calibrating.is_none() && self.ob.is_recording() {
+            self.onboard_key_events(&events);
+            return;
+        }
         for (code, down) in events {
             let Some(led) = self.calibrating else { return };
             if !down {
@@ -265,11 +283,22 @@ impl eframe::App for App {
         }
         self.handle_key_events();
 
-        let (status, fps, preview, device_hw, devices, device) = {
+        let (status, fps, preview, device_hw, devices, device, connections, onboard) = {
             let sh = self.shared.lock().unwrap();
-            (sh.status.clone(), sh.fps, sh.preview.clone(), sh.device_hw, sh.devices.clone(), sh.device.clone())
+            (sh.status.clone(), sh.fps, sh.preview.clone(), sh.device_hw, sh.devices.clone(), sh.device.clone(), sh.connections, sh.onboard.clone())
         };
         self.sync_device(device);
+        if connections != self.connections_seen {
+            // Reconectou (por exemplo, depois do padrão de fábrica): relê tudo.
+            self.connections_seen = connections;
+            self.synced_from_device = false;
+            self.ob.reset_device();
+        }
+        self.onboard_sync(onboard);
+        if !self.has_onboard() {
+            self.ob.page = Page::Light;
+        }
+        self.onboard_load();
         if !self.synced_from_device
             && let Some(hw) = device_hw
         {
@@ -292,35 +321,58 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin::symmetric(24, 14)))
             .show(ui, |ui| self.header(ui, &status, fps, &devices));
 
-        egui::Panel::bottom("controls")
-            .resizable(false)
-            .exact_size(CONTROLS_HEIGHT)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::PANEL)
-                    .inner_margin(Margin { left: 24, right: 24, top: 20, bottom: 16 })
-                    .stroke(Stroke::new(1.0, theme::EDGE)),
-            )
-            .show(ui, |ui| self.controls(ui));
+        let page = self.ob.page;
+        if matches!(page, Page::Light | Page::Keys) {
+            egui::Panel::bottom("controls")
+                .resizable(false)
+                .exact_size(CONTROLS_HEIGHT)
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::PANEL)
+                        .inner_margin(Margin { left: 24, right: 24, top: 20, bottom: 16 })
+                        .stroke(Stroke::new(1.0, theme::EDGE)),
+                )
+                .show(ui, |ui| if page == Page::Keys { self.keys_panel(ui) } else { self.controls(ui) });
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin::symmetric(24, 8)))
-            .show(ui, |ui| self.hero(ui, &preview, &pressed, input_error.filter(|_| input_devices == 0)));
+            .show(ui, |ui| match page {
+                Page::Light | Page::Keys => self.hero(ui, &preview, &pressed, input_error.filter(|_| input_devices == 0)),
+                Page::Macros => self.macros_page(ui),
+                Page::Keyboard => self.keyboard_page(ui),
+            });
 
         self.apply_hw_if_changed();
     }
 }
 
 impl App {
+    fn has_onboard(&self) -> bool {
+        self.device.as_ref().is_some_and(|d| d.onboard)
+    }
+
     fn header(&mut self, ui: &mut egui::Ui, status: &Status, fps: f32, devices: &[crate::drivers::DeviceEntry]) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("keyglow").font(semibold(24.0)).color(theme::TEXT));
             ui.add_space(28.0);
 
-            let mut software = self.is_software();
-            segmented(ui, &mut software, [(false, "Do teclado"), (true, "Do app")]);
-            self.set_mode(software);
-            ui.add_space(16.0);
+            if self.has_onboard() {
+                let mut page = self.ob.page;
+                segmented(ui, &mut page, [(Page::Light, "Luz"), (Page::Keys, "Teclas"), (Page::Macros, "Macros"), (Page::Keyboard, "Teclado")]);
+                if page != self.ob.page {
+                    self.ob.page = page;
+                    self.ob.selected = None;
+                    self.set_calibration(None);
+                }
+                ui.add_space(16.0);
+            }
+            if self.ob.page == Page::Light {
+                let mut software = self.is_software();
+                segmented(ui, &mut software, [(false, "Do teclado"), (true, "Do app")]);
+                self.set_mode(software);
+                ui.add_space(16.0);
+            }
             self.device_picker(ui, devices);
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| match status {
@@ -386,9 +438,22 @@ impl App {
 
         let mapped = self.key_to_led.len();
         let grid = self.grid.clone();
-        let data = ViewData { preview, grid: &grid, key_to_led: &self.key_to_led, pressed, calibrating: self.calibrating };
+        let editing_keys = self.ob.page == Page::Keys;
+        let changed = if editing_keys { self.changed_leds() } else { BTreeSet::new() };
+        let labels = if editing_keys { self.grid_labels() } else { BTreeMap::new() };
+        let data = ViewData {
+            preview,
+            grid: &grid,
+            key_to_led: &self.key_to_led,
+            pressed,
+            calibrating: self.calibrating,
+            selected: self.ob.selected.filter(|_| editing_keys).map(|(_, led)| led),
+            marked: editing_keys.then_some(&changed),
+            labels: editing_keys.then_some(&labels),
+        };
         let max_h = ui.available_height() - 44.0;
-        let view = if self.calibrating.is_none() && mapped >= MIN_MAPPED_FOR_PHYSICAL {
+        let grid_only = editing_keys && self.ob.show_grid;
+        let view = if self.calibrating.is_none() && mapped >= MIN_MAPPED_FOR_PHYSICAL && !grid_only {
             keyboard_view::physical(ui, &data, max_h)
         } else {
             keyboard_view::matrix(ui, &data, max_h)
@@ -409,6 +474,10 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.calibrating.is_some() {
                     return;
+                }
+                if editing_keys && mapped >= MIN_MAPPED_FOR_PHYSICAL {
+                    ui.checkbox(&mut self.ob.show_grid, "Grade completa")
+                        .on_hover_text("Mostra todas as posições do teclado, inclusive as que não aparecem no desenho");
                 }
                 let label = if mapped == 0 { "Calibrar teclas" } else { "Recalibrar" };
                 if ui.button(label).clicked() {
@@ -431,7 +500,11 @@ impl App {
 
     fn handle_view_click(&mut self, view: keyboard_view::ViewResponse) {
         let Some(led) = view.led else { return };
-        if self.calibrating.is_some() {
+        if self.ob.page == Page::Keys && self.calibrating.is_none() {
+            if view.clicked {
+                self.select_key(led);
+            }
+        } else if self.calibrating.is_some() {
             if view.clicked {
                 self.set_calibration(Some(led));
             }
@@ -624,8 +697,8 @@ impl App {
 // ---------------------------------------------------------------------------
 // Componentes
 
-/// Controle segmentado de duas opções.
-fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options: [(T, &str); 2]) {
+/// Controle segmentado (uma opção por botão).
+fn segmented<T: PartialEq + Copy, const N: usize>(ui: &mut egui::Ui, value: &mut T, options: [(T, &str); N]) {
     egui::Frame::new()
         .fill(theme::DECK)
         .corner_radius(CornerRadius::same(8))
@@ -640,7 +713,7 @@ fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options: [(T
                         .fill(if selected { theme::RAISED } else { Color32::TRANSPARENT })
                         .stroke(Stroke::NONE)
                         .corner_radius(CornerRadius::same(6))
-                        .min_size(Vec2::new(104.0, 28.0));
+                        .min_size(Vec2::new(84.0, 28.0));
                     if ui.add(button).clicked() {
                         *value = option;
                     }

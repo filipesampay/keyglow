@@ -20,6 +20,11 @@ pub struct DeviceConfig {
     pub key_to_led: BTreeMap<u16, usize>,
     /// Cores do efeito "Pintura".
     pub paint: Vec<Rgb>,
+    /// Tabela de teclas como estava na primeira vez que o keyglow a leu
+    /// (hexadecimal), para desfazer as mudanças.
+    pub original_keys: String,
+    /// Nomes das macros (o teclado só guarda os passos).
+    pub macro_names: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -57,7 +62,7 @@ impl Config {
         let key_to_led = std::mem::take(&mut self.key_to_led);
         let paint = std::mem::take(&mut self.params.paint);
         if (!key_to_led.is_empty() || !paint.is_empty()) && !self.devices.contains_key(LEGACY_DEVICE) {
-            self.devices.insert(LEGACY_DEVICE.to_string(), DeviceConfig { key_to_led, paint });
+            self.devices.insert(LEGACY_DEVICE.to_string(), DeviceConfig { key_to_led, paint, ..Default::default() });
         }
         self
     }

@@ -41,9 +41,14 @@ pub fn enumerate() -> io::Result<Vec<HidInfo>> {
             continue;
         };
         let desc = fs::read(dev.join("report_descriptor")).unwrap_or_default();
+        // `device` é a interface HID; dois níveis acima fica o dispositivo USB.
+        let release = fs::read_to_string(dev.join("../../bcdDevice"))
+            .ok()
+            .and_then(|t| u16::from_str_radix(t.trim(), 16).ok())
+            .unwrap_or(0);
         let path = Path::new("/dev").join(entry.file_name()).to_string_lossy().into_owned();
         for (usage_page, usage) in descriptor::top_level_usages(&desc) {
-            out.push(HidInfo { path: path.clone(), vid, pid, usage_page, usage, product: product.clone() });
+            out.push(HidInfo { path: path.clone(), vid, pid, usage_page, usage, product: product.clone(), release });
         }
     }
     Ok(out)

@@ -123,6 +123,29 @@ pub trait Driver: Send {
     fn default_key_map(&self) -> BTreeMap<u16, usize> {
         BTreeMap::new()
     }
+
+    /// Memória do teclado (mapa de teclas, macros), se o keyglow sabe mexer nela.
+    fn onboard(&mut self) -> Option<&mut dyn Onboard> {
+        None
+    }
+
+    /// Versão do firmware informada pelo teclado, se houver.
+    fn firmware_version(&self) -> Option<u16> {
+        None
+    }
+}
+
+/// Configurações gravadas no próprio teclado. Os formatos estão em
+/// [`crate::onboard`].
+pub trait Onboard {
+    /// Tabela de teclas, linha por linha ([`crate::onboard::SLOTS`] posições).
+    fn read_keys(&mut self) -> io::Result<Vec<crate::onboard::Cell>>;
+    fn write_keys(&mut self, cells: &[crate::onboard::Cell]) -> io::Result<()>;
+    /// Bloco de macros como está no teclado.
+    fn read_macros(&mut self) -> io::Result<Vec<u8>>;
+    fn write_macros(&mut self, block: &[u8]) -> io::Result<()>;
+    /// Volta o teclado inteiro (luz, teclas e macros) ao padrão de fábrica.
+    fn factory_reset(&mut self) -> io::Result<()>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

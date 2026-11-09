@@ -1,5 +1,5 @@
 //! Leitura das teclas, com uma implementação por sistema:
-//! - Linux: evdev, só os dispositivos deste teclado (`linux.rs`);
+//! - Linux: evdev, só os dispositivos do teclado conectado (`linux.rs`);
 //! - Windows: hook global de teclado (`windows.rs`).
 //!
 //! Os códigos de tecla são sempre os do Linux (evdev), inclusive no Windows,
@@ -26,11 +26,14 @@ pub struct InputState {
     pub gui_events: Vec<(u16, bool)>,
     /// Quantas fontes de teclas estão ativas.
     pub devices: usize,
+    /// (VID, PID) do teclado conectado. No Linux, só ele é lido.
+    pub target: Option<(u16, u16)>,
     pub error: Option<String>,
 }
 
 impl InputState {
     /// Registra uma tecla pressionada (`down`) ou solta. Ignora repetições.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn record(&mut self, code: u16, down: bool) {
         if code == KEY_PHANTOM {
             return;
@@ -54,6 +57,10 @@ pub fn spawn(state: Arc<Mutex<InputState>>) {
     linux::spawn(state);
     #[cfg(windows)]
     windows::spawn(state);
+    #[cfg(target_os = "macos")]
+    {
+        state.lock().unwrap().error = Some("leitura de teclas ainda não suportada no macOS".into());
+    }
 }
 
 /// Nome curto de uma tecla (código evdev) para mostrar na tela.

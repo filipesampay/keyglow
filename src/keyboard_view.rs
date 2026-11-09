@@ -2,11 +2,10 @@
 //!
 //! - **Físico**: layout ABNT2 completo, posicionado pelo código da tecla.
 //!   Usado quando a calibração já mapeou as teclas.
-//! - **Matriz**: a grade 6x21 de LEDs do firmware. Usada na calibração e
+//! - **Matriz**: a grade de LEDs do teclado conectado. Usada na calibração e
 //!   enquanto o teclado ainda não foi calibrado.
 
-use crate::device::{Frame, Rgb, COLS, LEDS, ROWS};
-use crate::effects::row_col;
+use crate::drivers::{Grid, Rgb};
 use crate::input::key_name;
 use crate::theme::{self, mix, with_alpha};
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
@@ -215,7 +214,8 @@ fn draw_underglow(painter: &egui::Painter, deck: Rect, leds: impl Iterator<Item 
 }
 
 pub struct ViewData<'a> {
-    pub preview: &'a Frame,
+    pub preview: &'a [Rgb],
+    pub grid: &'a Grid,
     pub key_to_led: &'a BTreeMap<u16, usize>,
     pub pressed: &'a BTreeSet<u16>,
     /// Posição atual da calibração, se ela estiver em andamento.
@@ -245,7 +245,7 @@ pub fn physical(ui: &mut egui::Ui, data: &ViewData, max_height: f32) -> ViewResp
     let origin = deck.min + Vec2::splat(pad * unit);
     let to_screen = |r: Rect| Rect::from_min_max(origin + r.min.to_vec2() * unit, origin + r.max.to_vec2() * unit).shrink(unit * 0.035);
 
-    draw_underglow(&painter, deck, data.key_to_led.values().map(|&led| data.preview[led]));
+    draw_underglow(&painter, deck, data.key_to_led.values().filter_map(|&led| data.preview.get(led).copied()));
     painter.rect_filled(deck, CornerRadius::same((unit * 0.3) as u8), theme::DECK);
     painter.rect_stroke(deck, CornerRadius::same((unit * 0.3) as u8), Stroke::new(1.0, theme::EDGE), StrokeKind::Inside);
 
@@ -256,7 +256,7 @@ pub fn physical(ui: &mut egui::Ui, data: &ViewData, max_height: f32) -> ViewResp
         if let Some(extra) = key.extra {
             rects.push(to_screen(extra));
         }
-        let led = data.key_to_led.get(&key.code).copied();
+        let led = data.key_to_led.get(&key.code).copied().filter(|&l| l < data.preview.len());
         let light = led.map(|l| data.preview[l]).unwrap_or([0; 3]);
         let mark = if data.pressed.contains(&key.code) { Mark::Pressed } else { Mark::None };
         draw_cap(&painter, &rects, light, &legend(key.code), mark, unit, led.is_some());
@@ -273,19 +273,21 @@ pub fn physical(ui: &mut egui::Ui, data: &ViewData, max_height: f32) -> ViewResp
     ViewResponse { led: hit, clicked: response.clicked(), dragged: response.dragged() }
 }
 
-/// Grade 6x21 do firmware, usada na calibração.
+/// Grade de LEDs do teclado, usada na calibração. Células sem LED aparecem
+/// vazias.
 pub fn matrix(ui: &mut egui::Ui, data: &ViewData, max_height: f32) -> ViewResponse {
     let led_to_key: BTreeMap<usize, u16> = data.key_to_led.iter().map(|(&k, &l)| (l, k)).collect();
-    let unit = ((ui.available_width() - 40.0) / COLS as f32).min(max_height / (ROWS as f32 + 0.6)).clamp(18.0, 60.0);
-    let size = Vec2::new(unit * COLS as f32, unit * ROWS as f32);
+    let (rows, cols) = (data.grid.rows, data.grid.cols);
+    let unit = ((ui.available_width() - 40.0) / cols as f32).min(max_height / (rows as f32 + 0.6)).clamp(12.0, 60.0);
+    let size = Vec2::new(unit * cols as f32, unit * rows as f32);
     let (outer, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), size.y + unit * 0.6), Sense::click_and_drag());
     let grid = Rect::from_center_size(outer.center(), size);
     let painter = ui.painter_at(outer);
     painter.rect_filled(grid.expand(unit * 0.25), CornerRadius::same(10), theme::DECK);
 
     let mut hit = None;
-    for led in 0..LEDS {
-        let (row, col) = row_col(led);
+    for led in 0..data.grid.len() {
+        let (row, col) = data.grid.row_col(led);
         let rect = Rect::from_min_size(grid.min + Vec2::new(col as f32, row as f32) * unit, Vec2::splat(unit)).shrink(unit * 0.05);
         let code = led_to_key.get(&led).copied();
         let mark = if data.calibrating == Some(led) {
@@ -297,8 +299,13 @@ pub fn matrix(ui: &mut egui::Ui, data: &ViewData, max_height: f32) -> ViewRespon
         } else {
             Mark::None
         };
+        if !data.grid.has_led(led) {
+            painter.rect_stroke(rect, CornerRadius::same(4), Stroke::new(1.0, with_alpha(Color32::WHITE, 0.04)), StrokeKind::Inside);
+            continue;
+        }
         let text = code.map(legend).unwrap_or_default();
-        draw_cap(&painter, &[rect], data.preview[led], &text, mark, unit, true);
+        let light = data.preview.get(led).copied().unwrap_or([0; 3]);
+        draw_cap(&painter, &[rect], light, &text, mark, unit, true);
         if response.interact_pointer_pos().is_some_and(|p| rect.contains(p)) {
             hit = Some(led);
         }

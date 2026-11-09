@@ -1,19 +1,20 @@
 //! Interface gráfica (egui).
 //!
 //! Estrutura da janela:
-//! - topo: nome, seletor "Do teclado | Do app" e status da conexão;
+//! - topo: nome, seletor "Do teclado | Do app", escolha do teclado e status;
 //! - centro: o teclado desenhado, com a luz atual e as teclas pressionadas;
 //! - base: lista de efeitos à esquerda e ajustes do efeito à direita.
 
-use crate::config::Config;
-use crate::device::{hw_mode_name, HwMode, Rgb, COLS, HW_MODES, LEDS};
-use crate::effects::{row_col, Control, EFFECTS};
-use crate::engine::{Cmd, Shared, Status};
+use crate::config::{Config, DeviceConfig, LEGACY_DEVICE};
+use crate::drivers::evision::hw_mode_name;
+use crate::drivers::{Grid, HwMode, Rgb};
+use crate::effects::{Control, EFFECTS};
+use crate::engine::{Cmd, DeviceView, Shared, Status};
 use crate::input::InputState;
 use crate::keyboard_view::{self, legend, ViewData};
 use crate::theme::{self, semibold};
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Sense, Stroke, Vec2};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -25,6 +26,8 @@ const MIN_MAPPED_FOR_PHYSICAL: usize = 20;
 /// na memória do teclado).
 const HW_APPLY_INTERVAL: Duration = Duration::from_millis(250);
 const CONTROLS_HEIGHT: f32 = 300.0;
+/// Cor inicial do efeito "Pintura".
+const PAINT_DEFAULT: Rgb = [40, 0, 80];
 
 pub struct App {
     shared: Arc<Mutex<Shared>>,
@@ -32,6 +35,11 @@ pub struct App {
     tx: Sender<Cmd>,
     engine: Option<JoinHandle<()>>,
     config: Config,
+    /// Teclado conectado e a grade dele.
+    device: Option<DeviceView>,
+    grid: Grid,
+    /// Mapa tecla -> célula do teclado conectado (salvo em `config.devices`).
+    key_to_led: BTreeMap<u16, usize>,
     /// Efeito de fábrica sendo editado; vai ao teclado com um pequeno atraso.
     hw_edit: HwMode,
     last_hw_apply: Instant,
@@ -55,10 +63,27 @@ impl App {
         mut config: Config,
     ) -> Self {
         theme::install(&cc.egui_ctx);
-        // Limpa mapeamentos inválidos de versões anteriores (volume, tecla fantasma).
-        config.key_to_led.retain(|&code, _| is_mappable(code));
-        shared.lock().unwrap().key_to_led = config.key_to_led.clone();
+        // Até um teclado conectar, mostra o último EVision usado (mesma grade
+        // padrão) ou o mapa do 320f:5016, para a tela já ter um teclado.
+        let preload = config.last_device.clone().filter(|id| id.starts_with("evision:")).unwrap_or(LEGACY_DEVICE.into());
+        let saved = config.devices.get(&preload).cloned().unwrap_or_default();
+        let grid = Grid::default();
+        let mut key_to_led = saved.key_to_led;
+        key_to_led.retain(|&code, &mut led| is_mappable(code) && led < grid.len());
+        if key_to_led.is_empty() {
+            key_to_led = crate::default_layout::default_key_to_led();
+        }
+        config.params.paint = saved.paint;
+        config.params.paint.resize(grid.len(), PAINT_DEFAULT);
+        {
+            let mut sh = shared.lock().unwrap();
+            sh.key_to_led = key_to_led.clone();
+            sh.params = config.params.clone();
+        }
         Self {
+            device: None,
+            grid,
+            key_to_led,
             shared,
             input,
             tx,
@@ -105,13 +130,63 @@ impl App {
         self.config.hw = self.hw_edit;
         self.last_hw_apply = Instant::now();
         self.send(Cmd::Hardware(self.hw_edit));
+        self.save();
+    }
+
+    /// Guarda a calibração e a pintura do teclado atual na configuração.
+    fn store_device(&mut self) {
+        if let Some(d) = &self.device {
+            let cfg = DeviceConfig { key_to_led: self.key_to_led.clone(), paint: self.config.params.paint.clone() };
+            self.config.devices.insert(d.entry.id.clone(), cfg);
+        }
+    }
+
+    fn save(&mut self) {
+        self.store_device();
         self.config.save();
+    }
+
+    /// Acompanha a troca de teclado: carrega a calibração e a pintura dele.
+    fn sync_device(&mut self, current: Option<DeviceView>) {
+        let Some(view) = current else { return };
+        if self.device.as_ref().is_some_and(|d| d.entry.id == view.entry.id && d.grid == view.grid) {
+            return;
+        }
+        self.store_device();
+        let len = view.grid.len();
+        let saved = self.config.devices.get(&view.entry.id).cloned().unwrap_or_default();
+        let mut keys = saved.key_to_led;
+        keys.retain(|&code, &mut led| is_mappable(code) && led < len);
+        if keys.is_empty() {
+            keys = view.default_key_map.clone();
+        }
+        let mut paint = saved.paint;
+        paint.resize(len, PAINT_DEFAULT);
+
+        self.key_to_led = keys;
+        self.config.params.paint = paint;
+        self.config.last_device = Some(view.entry.id.clone());
+        self.grid = view.grid.clone();
+        self.device = Some(view);
+        self.synced_from_device = false;
+        self.calibrating = None;
+        self.last_mapped = None;
+        let mut sh = self.shared.lock().unwrap();
+        sh.key_to_led = self.key_to_led.clone();
+        sh.params = self.config.params.clone();
+        sh.calibrate_led = None;
+    }
+
+    fn hw_modes(&self) -> &'static [(u8, &'static str)] {
+        self.device.as_ref().map_or(&[], |d| d.hw_modes)
     }
 
     /// Cor que o teclado está mostrando, usada como destaque da interface.
     fn light_color(&self) -> Rgb {
         if self.is_software() {
             self.config.params.primary
+        } else if self.hw_modes().is_empty() {
+            [160, 170, 200]
         } else if self.hw_edit.random {
             [127, 178, 255]
         } else {
@@ -124,17 +199,26 @@ impl App {
         self.shared.lock().unwrap().calibrate_led = led;
     }
 
-    fn calibration_next(&mut self, from: usize) {
-        if from + 1 >= LEDS {
-            self.finish_calibration();
-        } else {
-            self.set_calibration(Some(from + 1));
+    /// Vai para a próxima célula com LED a partir de `from` (inclusive).
+    fn calibration_goto(&mut self, from: usize) {
+        match (from..self.grid.len()).find(|&i| self.grid.has_led(i)) {
+            Some(i) => self.set_calibration(Some(i)),
+            None => self.finish_calibration(),
         }
+    }
+
+    fn calibration_next(&mut self, from: usize) {
+        self.calibration_goto(from + 1);
+    }
+
+    fn calibration_prev(&mut self, from: usize) {
+        let prev = (0..from).rev().find(|&i| self.grid.has_led(i)).unwrap_or(from);
+        self.set_calibration(Some(prev));
     }
 
     fn finish_calibration(&mut self) {
         self.set_calibration(None);
-        self.config.save();
+        self.save();
     }
 
     fn handle_key_events(&mut self) {
@@ -148,13 +232,13 @@ impl App {
             // matriz não têm LED, então não há nada para apertar nelas.
             match code {
                 KEY_VOLUMEUP => self.calibration_next(led),
-                KEY_VOLUMEDOWN => self.set_calibration(Some(led.saturating_sub(1))),
+                KEY_VOLUMEDOWN => self.calibration_prev(led),
                 _ if !is_mappable(code) => {}
                 _ => {
                     // A tecla apertada vira a dona do LED atual.
-                    self.config.key_to_led.retain(|&k, &mut l| k != code && l != led);
-                    self.config.key_to_led.insert(code, led);
-                    self.shared.lock().unwrap().key_to_led = self.config.key_to_led.clone();
+                    self.key_to_led.retain(|&k, &mut l| k != code && l != led);
+                    self.key_to_led.insert(code, led);
+                    self.shared.lock().unwrap().key_to_led = self.key_to_led.clone();
                     self.last_mapped = Some((code, led));
                     self.calibration_next(led);
                 }
@@ -181,10 +265,11 @@ impl eframe::App for App {
         }
         self.handle_key_events();
 
-        let (status, fps, preview, device_hw) = {
+        let (status, fps, preview, device_hw, devices, device) = {
             let sh = self.shared.lock().unwrap();
-            (sh.status.clone(), sh.fps, sh.preview, sh.device_hw)
+            (sh.status.clone(), sh.fps, sh.preview.clone(), sh.device_hw, sh.devices.clone(), sh.device.clone())
         };
+        self.sync_device(device);
         if !self.synced_from_device
             && let Some(hw) = device_hw
         {
@@ -205,7 +290,7 @@ impl eframe::App for App {
 
         egui::Panel::top("header")
             .frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin::symmetric(24, 14)))
-            .show(ui, |ui| self.header(ui, &status, fps));
+            .show(ui, |ui| self.header(ui, &status, fps, &devices));
 
         egui::Panel::bottom("controls")
             .resizable(false)
@@ -227,7 +312,7 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn header(&mut self, ui: &mut egui::Ui, status: &Status, fps: f32) {
+    fn header(&mut self, ui: &mut egui::Ui, status: &Status, fps: f32, devices: &[crate::drivers::DeviceEntry]) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("keyglow").font(semibold(24.0)).color(theme::TEXT));
             ui.add_space(28.0);
@@ -235,30 +320,73 @@ impl App {
             let mut software = self.is_software();
             segmented(ui, &mut software, [(false, "Do teclado"), (true, "Do app")]);
             self.set_mode(software);
+            ui.add_space(16.0);
+            self.device_picker(ui, devices);
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| match status {
                 Status::Connected => {
                     if self.is_software() || self.calibrating.is_some() {
                         ui.label(RichText::new(format!("{fps:.0} quadros/s")).small().weak());
                     }
-                    ui.label("Teclado conectado");
+                    ui.label("Conectado");
                     status_dot(ui, theme::OK);
                 }
                 Status::Connecting(msg) => {
-                    ui.label(RichText::new(msg).color(theme::ERROR));
+                    ui.add(egui::Label::new(RichText::new(msg).color(theme::ERROR)).truncate()).on_hover_text(msg);
                     status_dot(ui, theme::ERROR);
                 }
             });
         });
     }
 
-    fn hero(&mut self, ui: &mut egui::Ui, preview: &[Rgb; LEDS], pressed: &BTreeSet<u16>, input_error: Option<String>) {
+    /// Escolha do teclado entre os encontrados na busca.
+    fn device_picker(&mut self, ui: &mut egui::Ui, devices: &[crate::drivers::DeviceEntry]) {
+        let label = |d: &crate::drivers::DeviceEntry| {
+            let mut s = format!("{}  ·  {}", d.name, d.kind.label());
+            if !d.tested {
+                s.push_str("  ·  não testado");
+            }
+            s
+        };
+        let current = self.device.as_ref().map(|d| d.entry.id.clone());
+        let selected_text = match self.device.as_ref() {
+            Some(d) => label(&d.entry),
+            None if devices.is_empty() => "Nenhum teclado".to_string(),
+            None => "Escolha o teclado".to_string(),
+        };
+        let mut chosen = None;
+        egui::ComboBox::from_id_salt("device")
+            .selected_text(selected_text)
+            .width(320.0)
+            .show_ui(ui, |ui| {
+                if devices.is_empty() {
+                    ui.label(RichText::new("Nenhum teclado compatível encontrado").weak());
+                }
+                for d in devices {
+                    if ui.selectable_label(current.as_deref() == Some(d.id.as_str()), label(d)).clicked() {
+                        chosen = Some(d.id.clone());
+                    }
+                }
+            });
+        if ui.button("Procurar").on_hover_text("Procura teclados de novo (só lista; não envia nada a eles)").clicked() {
+            self.send(Cmd::Rescan);
+        }
+        if let Some(id) = chosen
+            && current.as_deref() != Some(id.as_str())
+        {
+            self.config.last_device = Some(id.clone());
+            self.send(Cmd::Select(id));
+        }
+    }
+
+    fn hero(&mut self, ui: &mut egui::Ui, preview: &[Rgb], pressed: &BTreeSet<u16>, input_error: Option<String>) {
         if let Some(led) = self.calibrating {
             self.calibration_banner(ui, led);
         }
 
-        let mapped = self.config.key_to_led.len();
-        let data = ViewData { preview, key_to_led: &self.config.key_to_led, pressed, calibrating: self.calibrating };
+        let mapped = self.key_to_led.len();
+        let grid = self.grid.clone();
+        let data = ViewData { preview, grid: &grid, key_to_led: &self.key_to_led, pressed, calibrating: self.calibrating };
         let max_h = ui.available_height() - 44.0;
         let view = if self.calibrating.is_none() && mapped >= MIN_MAPPED_FOR_PHYSICAL {
             keyboard_view::physical(ui, &data, max_h)
@@ -284,7 +412,7 @@ impl App {
                 }
                 let label = if mapped == 0 { "Calibrar teclas" } else { "Recalibrar" };
                 if ui.button(label).clicked() {
-                    self.set_calibration(Some(0));
+                    self.calibration_goto(0);
                 }
                 match &input_error {
                     Some(err) => {
@@ -307,7 +435,7 @@ impl App {
             if view.clicked {
                 self.set_calibration(Some(led));
             }
-        } else if self.is_painting() && (view.clicked || view.dragged) {
+        } else if self.is_painting() && (view.clicked || view.dragged) && led < self.config.params.paint.len() {
             self.config.params.paint[led] = self.brush;
             self.shared.lock().unwrap().params = self.config.params.clone();
         }
@@ -318,7 +446,9 @@ impl App {
     }
 
     fn calibration_banner(&mut self, ui: &mut egui::Ui, led: usize) {
-        let (row, col) = row_col(led);
+        let (row, col) = self.grid.row_col(led);
+        let total = self.grid.len();
+        let cols = self.grid.cols;
         egui::Frame::new()
             .fill(theme::PANEL)
             .stroke(Stroke::new(1.0, theme::WARN))
@@ -328,7 +458,7 @@ impl App {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
-                        ui.label(RichText::new(format!("Calibrando a posição {} de {LEDS}", led + 1)).font(semibold(17.0)));
+                        ui.label(RichText::new(format!("Calibrando a posição {} de {total}", led + 1)).font(semibold(17.0)));
                         ui.label(format!(
                             "Aperte a tecla que está piscando no teclado (linha {}, coluna {}). Se nada piscar, gire o volume para cima para pular.",
                             row + 1,
@@ -336,7 +466,7 @@ impl App {
                         ));
                         let last = match self.last_mapped {
                             Some((code, l)) => {
-                                let (r, c) = row_col(l);
+                                let (r, c) = self.grid.row_col(l);
                                 format!("Última calibrada: {} na linha {}, coluna {}", legend(code), r + 1, c + 1)
                             }
                             None => "Volume para baixo volta uma posição. Clique numa posição da grade para ir direto até ela.".into(),
@@ -348,8 +478,7 @@ impl App {
                             self.finish_calibration();
                         }
                         if ui.button("Pular linha").clicked() {
-                            let next = (row + 1) * COLS;
-                            if next >= LEDS { self.finish_calibration() } else { self.set_calibration(Some(next)) }
+                            self.calibration_goto((row + 1) * cols);
                         }
                         if ui.button("Pular").clicked() {
                             self.calibration_next(led);
@@ -377,10 +506,14 @@ impl App {
                         self.send(Cmd::Software(i));
                     }
                 } else {
-                    let names: Vec<&str> = HW_MODES.iter().map(|(_, n)| *n).collect();
-                    let current = HW_MODES.iter().position(|(m, _)| *m == self.hw_edit.mode);
+                    let modes = self.hw_modes();
+                    let names: Vec<&str> = modes.iter().map(|(_, n)| *n).collect();
+                    let current = modes.iter().position(|(m, _)| *m == self.hw_edit.mode);
                     if let Some(i) = effect_grid(ui, "hw_effects", &names, current, 3, accent) {
-                        self.hw_edit.mode = HW_MODES[i].0;
+                        self.hw_edit.mode = modes[i].0;
+                    }
+                    if modes.is_empty() {
+                        ui.label(RichText::new("Nenhum efeito de fábrica disponível").weak());
                     }
                 }
             });
@@ -400,6 +533,14 @@ impl App {
     }
 
     fn hardware_settings(&mut self, ui: &mut egui::Ui) {
+        if self.hw_modes().is_empty() {
+            let name = self.device.as_ref().map_or("Sem teclado", |d| d.entry.name.as_str());
+            ui.label(RichText::new(name).font(semibold(20.0)));
+            ui.label(RichText::new(
+                "O keyglow não controla os efeitos de fábrica deste teclado. Em \"Do teclado\", ele volta a mostrar o efeito próprio dele.",
+            ).weak());
+            return;
+        }
         ui.label(RichText::new(hw_mode_name(self.hw_edit.mode)).font(semibold(20.0)));
         ui.label(RichText::new("Fica gravado no teclado e continua funcionando com o keyglow fechado.").weak());
         ui.add_space(8.0);
@@ -446,7 +587,7 @@ impl App {
                 ui.horizontal(|ui| {
                     color_button(ui, &mut self.brush);
                     if ui.button("Pintar todas as teclas").clicked() {
-                        p.paint = vec![self.brush; LEDS];
+                        p.paint = vec![self.brush; self.grid.len()];
                     }
                 });
                 ui.end_row();
@@ -578,7 +719,7 @@ fn status_dot(ui: &mut egui::Ui, color: Color32) {
 impl Drop for App {
     /// Ao fechar: salva a configuração e devolve o teclado ao efeito de fábrica.
     fn drop(&mut self) {
-        self.config.save();
+        self.save();
         self.send(Cmd::Shutdown);
         if let Some(handle) = self.engine.take() {
             let _ = handle.join();

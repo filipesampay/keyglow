@@ -1,5 +1,12 @@
-# keyglow: dá ao usuário logado acesso ao teclado SONiX/EVision 320f:5016.
+# keyglow: dá ao usuário logado acesso aos teclados EVision.
 # - hidraw: controle das cores
-# - input: leitura das teclas (só deste teclado, não de todos)
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="320f", ATTRS{idProduct}=="5016", TAG+="uaccess"
-SUBSYSTEM=="input", ATTRS{idVendor}=="320f", ATTRS{idProduct}=="5016", TAG+="uaccess"
+# - input: leitura das teclas (só destes teclados, não de todos)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="320f", TAG+="uaccess"
+SUBSYSTEM=="input", ATTRS{idVendor}=="320f", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3299", TAG+="uaccess"
+SUBSYSTEM=="input", ATTRS{idVendor}=="3299", TAG+="uaccess"
+
+# Teclado LampArray: copie as duas linhas abaixo trocando VVVV/PPPP pelo ID USB
+# dele (veja com `lsusb` ou `keyglow --scan`) e tire o "#".
+# SUBSYSTEM=="hidraw", ATTRS{idVendor}=="VVVV", ATTRS{idProduct}=="PPPP", TAG+="uaccess"
+# SUBSYSTEM=="input", ATTRS{idVendor}=="VVVV", ATTRS{idProduct}=="PPPP", TAG+="uaccess"
